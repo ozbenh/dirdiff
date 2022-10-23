@@ -7,7 +7,9 @@ LIBDIR=$(DESTDIR)/usr/lib
 INSTALL=install
 
 # You may need to change the -I arguments depending on your system
-CFLAGS=-O3 -I/usr/include/tcl8.3/ -I/usr/include/tcl
+CFLAGS=-O3 $(pkg-config --cflags tcl)
+
+LIBS = $(pkg-config --libs tcl)
 
 all:	libfilecmp.so.0.0
 
