@@ -1,0 +1,4744 @@
+#!/bin/sh
+# Tcl ignores the next line \
+exec wish "$0" -- "${1+$@}"
+
+# Copyright (C) 1999-2004 Paul Mackerras.  All rights reserved.
+# This program is free software; it may be used, copied, modified
+# and distributed under the terms of the GNU General Public Licence,
+# either version 2, or (at your option) any later version.
+
+set Script [info script]
+set ScriptTail [file tail $Script]
+if {[file type $Script] == "link"} {
+  set ScriptBin [file join [file dirname $Script] [file readlink $Script]]
+} else { 
+  set ScriptBin $Script
+}
+set TclExe [info nameofexecutable]
+set compound_ok [expr {$tcl_version >= 8.4}]
+
+set nofilecmp [catch {load libfilecmp.so.0.0}]
+set rcsflag {}
+set diffbflag {}
+set diffBflag {}
+set diffiflag {}
+set diffwflag {}
+set diffdflag {}
+set ctxlines 3
+set showsame 0
+set underlinetabs 0
+set redisp_immed 1
+set diffnewfirst 0
+set nukefiles {*.o *~ *.orig CVS *.a *.link *.old *.save .depend .*.flags SCCS}
+set filelistfont {Helvetica -12}
+set textfont {Courier -12}
+set maxdepth 9999999
+set nxdirmode 0
+set docvsignore 0
+
+set defaultcvsignore {
+    RCS SCCS CVS CVS.adm RCSLOG cvslog.* tags TAGS
+    .make.state .nse_depinfo *~ \#* .\#* ,* _$* *$
+    *.old *.bak *.BAK *.orig *.rej .del-* *.a *.olb
+    *.o *.obj *.so *.exe *.Z *.elc *.ln core
+}
+
+if {$tcl_platform(platform) == "windows"} {
+   set TclExe [file attributes $TclExe -shortname]
+   # I don't like it any better than you do
+   set nullfile "C:/temp/nulfile"
+   set nf [open "$nullfile" w]
+   close $nf
+} else {
+   set nullfile "/dev/null"
+}
+set diffprogram {}
+set showprogram {}
+
+set numlines 20
+set canvy0 0
+set canvy 0
+set canvx 0
+
+set have_unidiff 1
+set caught [catch "exec diff -u $nullfile $nullfile" err]
+if {$caught != 0} {
+   puts "Unified diff not available.  Will use context diff for patches."
+   set have_unidiff 0
+}
+
+catch {source ~/.dirdiff}
+
+proc ignorefile pat {
+    global nukefiles
+    if {$pat == "!"} {
+	set nukefiles {}
+    } else {
+	lappend nukefiles $pat
+    }
+}
+
+set linespc [font metrics $filelistfont -linespace]
+if {$linespc < 15} {set linespc 15}
+set blotw [expr $linespc-3]
+set bloth [expr $linespc-3]
+set blotspc $linespc
+
+proc usage {} {
+    puts stderr {Usage: dirdiff [options]... dir1 dir2 ...
+
+Options:
+   -a, --all		don't exclude any files
+   -o, --only pattern	only process files matching pattern
+   -I, --ignore pattern	don't process files matching pattern
+   -r, --rcs		ignore differences in RCS strings
+   -c, --context num	set number of lines of context to show
+   -b, -w, -B, -i, -d	pass these on to diff(1)
+   -S			show files that are the same in the file list
+   -C			Ignore files listed in .cvsignore files
+
+Note: dirdiff needs to be able to load the libfilecmp.so.0.0 shared library
+for the -r or -t flags to work.}
+}
+
+proc NewDirDialog {} {
+   global d0 d1 d2 d3 d4
+   toplevel .newdirDlg
+   wm transient .newdirDlg
+   wm title .newdirDlg "Directories"
+   set waitvar 0
+
+   frame .newdirDlg.top -borderwidth 2 -relief groove
+   pack .newdirDlg.top -side top -fill x \
+      -ipadx 20 -ipady 20 -padx 5 -pady 5
+
+   button .newdirDlg.top.b0 -text "Browse..." -command { set d0 [tk_chooseDirectory] }
+   button .newdirDlg.top.b1 -text "Browse..." -command { set d1 [tk_chooseDirectory] }
+   button .newdirDlg.top.b2 -text "Browse..." -command { set d2 [tk_chooseDirectory] }
+   button .newdirDlg.top.b3 -text "Browse..." -command { set d3 [tk_chooseDirectory] }
+   button .newdirDlg.top.b4 -text "Browse..." -command { set d4 [tk_chooseDirectory] }
+   for { set n 0 } { $n < 5 } { incr n } {
+      set dn [expr {$n + 1}]
+      label .newdirDlg.top.l$n -text "Directory $dn"
+      entry .newdirDlg.top.e$n -width 25 -textvariable d$n
+      grid .newdirDlg.top.l$n -row $n -column 0 -sticky e
+      grid .newdirDlg.top.e$n -row $n -column 1 -sticky sew -pady 4
+      grid .newdirDlg.top.b$n -row $n -column 2 -sticky w
+   }
+   grid columnconfigure .newdirDlg.top 0 -weight 0
+   grid columnconfigure .newdirDlg.top 1 -weight 1
+   grid columnconfigure .newdirDlg.top 2 -weight 0
+
+   frame .newdirDlg.bot
+   button .newdirDlg.bot.ok -text "OK" -width 5 -default active \
+      -command {
+         set dirs [list $d0 $d1 $d2 $d3 $d4]
+         destroy .newdirDlg
+         set waitvar 1
+      }
+   button .newdirDlg.bot.cancel -text "Cancel" -width 5 -default normal \
+      -command {
+         set dirs {}
+         destroy .newdirDlg
+         exit 0
+      }
+
+   pack .newdirDlg.bot -side bottom -fill x -expand n
+   pack .newdirDlg.bot.ok .newdirDlg.bot.cancel \
+      -side left -fill none -expand y -pady 4
+
+   tkwait variable waitvar
+}
+
+proc addfiles {sd} {
+    global dirs stat onlyfiles statinfo fserial nextserial
+    global filetype filesize filetime nxdirmode
+    global docvsignore cvsignores defaultcvsignore
+    if {$nxdirmode == 0} {
+	set dcount 0
+	foreach d $dirs {
+	    if {[catch {file stat $d/$sd stat}] == 0} {
+		if {$stat(type) == "directory"} {incr dcount}
+	    }
+	}
+	if {$dcount <= 1} {
+	    return {}
+	}
+    }
+    if {$docvsignore} {
+	# read the .cvsignore in each directory
+	set cvsignores($sd) {}
+	foreach d $dirs {
+	    catch {
+		set ign $defaultcvsignore
+		set f [open $d/$sd.cvsignore r]
+		while {[gets $f line] >= 0} {
+		    foreach i [split $line] {
+			if {$i == "!"} {
+			    set ign {}
+			} else {
+			    lappend ign $i
+			}
+		    }
+		}
+		close $f
+		set cvsignores($sd) [concat $cvsignores($sd) $ign]
+	    }
+	}
+	set cvsignores($sd) [lsort -unique $cvsignores($sd)]
+    }
+    foreach d $dirs {
+	foreach f [lsort [glob -nocomplain $d/$sd* $d/$sd.*]] {
+	    set fs $sd[file tail $f]
+	    set wantim 0
+	    if [notnuked $fs] {
+		if {[catch {file lstat $f stat}] == 0} {
+		    if {$stat(type) == "file"} {
+			if [info exists onlyfiles] {
+			    foreach o $onlyfiles {
+				if [string match $o $fs] {
+				    set wantim 1
+				    break
+				}
+			    }
+			} else {
+			    set wantim [notcvsignored $fs]
+			}
+		    } elseif {$stat(type) == "directory"} {
+			append fs /
+			set wantim 1
+		    }
+		}
+	    }
+	    if {$wantim} {
+		if {![info exists files($fs)]} {
+		    set fserial($fs) [incr nextserial]
+		    set files($fs) 1
+		}
+		set filetype($f) $stat(type)
+		set filesize($f) $stat(size)
+		set filetime($f) $stat(mtime)
+	    }
+	}
+    }
+    return [lsort [array names files]]
+}
+
+# Called to re-lstat a given file across all directories
+proc updatefileinfo {f} {
+    global dirs filetype filesize filetime
+
+    foreach d $dirs {
+	set df [joinname $d [string trimright $f /]]
+	if {[catch {file lstat $df stat}] == 0} {
+	    set filetype($df) $stat(type)
+	    set filesize($df) $stat(size)
+	    set filetime($df) $stat(mtime)
+	} else {
+	    catch {unset filetype($df)}
+	}
+    }
+}
+
+# Returns 1 if we are interested in this file, i.e. if it isn't
+# matched by something in the exclude list
+proc notnuked {f} {
+    global nukefiles
+    set ft [file tail $f]
+    if {$ft == "." || $ft == ".."} {
+	return 0
+    }
+    foreach n $nukefiles {
+	if {[string match $n $f] || [string match $n $ft]} {
+	    return 0
+	}
+    }
+    return 1
+}
+
+proc notcvsignored {f} {
+    global docvsignore cvsignores
+    set sd [file dirname $f]/
+    if {$sd == "./"} {
+	set sd ""
+    }
+    set ft [file tail $f]
+    if {$docvsignore && [info exists cvsignores($sd)]} {
+	foreach n $cvsignores($sd) {
+	    if {[string match $n $ft]} {
+		return 0
+	    }
+	}
+    }
+    return 1
+}
+
+proc joinname {dir f} {
+    global filemode
+    if {$filemode} {
+	return $dir
+    }
+    return [file join $dir $f]
+}
+
+proc fileisa {f t} {
+    global filetype
+    return [expr {[info exists filetype($f)] && $filetype($f) == $t}]
+}
+
+proc diffages {f showsame maxdepth} {
+    global dirs nofilecmp rcsflag filesize filetime nxdirmode
+    set numgroups 0
+    set notexist {}
+    set doesexist {}
+    foreach d $dirs {
+	set sameas($d) {}
+	set group($d) 0
+	set fname [joinname $d [string trimright $f /]]
+	if {!([fileisa $fname "file"]
+	      || ($maxdepth <= 0 && [fileisa $fname "directory"]))} {
+	    set fd [file dirname $fname]
+	    if {$nxdirmode || [file dirname $f] == "." \
+		    || [fileisa $fd "directory"]} {
+		lappend notexist $d
+	    }
+	} else {
+	    lappend doesexist $d
+	    set fsize($d) $filesize($fname)
+	    set fmtime($d) $filetime($fname)
+	    foreach d2 $dirs {
+		if {$d2 == $d} break
+		if {$sameas($d2) != "" || $group($d2) == 0} continue
+		if {$fsize($d) == $fsize($d2) \
+			&& $fmtime($d) == $fmtime($d2)} {
+		    set notsame 0
+		} elseif {$rcsflag != "" || $fsize($d) == $fsize($d2)} {
+		    set fname2 [joinname $d2 [string trimright $f /]]
+		    if $nofilecmp {
+			set notsame [catch {exec cmp -s $fname $fname2}]
+		    } else {
+			set same 0
+			catch {
+			    set same [eval filecmp $rcsflag $fname $fname2]
+			}
+			set notsame [expr !$same]
+		    }
+		} else {
+		    set notsame 1
+		}
+		if {$notsame == 0} {
+		    set sameas($d) $d2
+		    set g $group($d2)
+		    set group($d) $g
+		    lappend groupelts($g) $d
+		    if {$fmtime($d) > $gmtime($g)} {
+			set gmtime($g) $fmtime($d)
+		    }
+		    break
+		}
+	    }
+	    if {$sameas($d) == ""} {
+		incr numgroups
+		set group($d) $numgroups
+		set groupelts($numgroups) $d
+		set gmtime($numgroups) $fmtime($d)
+	    }
+	}
+    }
+    if {!$showsame && $numgroups == 1 && $notexist == ""} {
+	return {}
+    }
+    set glist {}
+    for {set g 1} {$g <= $numgroups} {incr g} {
+	lappend glist [list [format "%.8x" $gmtime($g)] $g]
+    }
+    set grank(0) 0
+    set rank 1
+    foreach xx [lsort -decreasing $glist] {
+	set g [lindex $xx 1]
+	set grank($g) $rank
+	incr rank
+    }
+    set res {}
+    foreach d $dirs {
+	lappend res $grank($group($d))
+    }
+    return [list $numgroups $res]
+}
+
+proc subdirgroups {sd} {
+    global dirs
+    set nummiss 0
+    set groups {}
+    foreach d $dirs {
+	set fn [joinname $d $sd]
+	if {![fileisa $fn "directory"]} {
+	    set pd [file dirname $sd]
+	    lappend groups 0
+	    set fnp [joinname $d $pd]
+	    if {$pd == "." || [fileisa $fnp "directory"]} {
+		incr nummiss
+	    }
+	} else {
+	    lappend groups 1
+	}
+    }
+    if {$nummiss == 0} {
+	return {}
+    }
+    return [list dir $groups]
+}
+
+set stringx 8
+
+proc initcanv {} {
+    global canvw canvx canvy canvy0 linespc stringx ruletype
+    global dirs arroww blotspc blotw ycoord filelistfont
+    $canvw delete all
+    $canvw yview moveto 0
+    $canvw conf -scrollregion {0 0 0 1}
+    catch {unset ycoord}
+    catch {unset ruletype}
+    set canvy $canvy0
+    if {![info exists arroww]} {
+	set stringx [expr $blotspc + 8]
+	return
+    }
+    set numdirs [llength $dirs]
+    set stringx [expr $numdirs * $blotspc + 8]
+    $arroww delete all
+    set arrowh [expr ($numdirs+1) * $linespc]
+    $arroww conf -height $arrowh
+    set y 0
+    set yoff [expr $linespc / 2]
+    set x [expr $canvx + 3 + ($blotw / 2)]
+    set x2 [expr $stringx - 3]
+    set horiz [expr $arrowh + 2]
+    foreach d $dirs {
+	set y2 [expr $y + $yoff]
+	set t [$arroww create line $x $horiz $x $y2 $x2 $y2 \
+		-width 2 -arrow first]
+	$arroww addtag arrows withtag $t
+	set t [$arroww create text $stringx $y -text $d -anchor nw \
+		   -font $filelistfont]
+	$arroww addtag strings withtag $t
+	incr y $linespc
+	incr x $blotspc
+    }
+    
+    set dx [expr [$arroww cget -width] / 2]
+    set dy [expr $horiz - 1]
+    $arroww create text $dx $dy -text "Older <- " -anchor se
+    $arroww create image $dx $dy -image paper_red -anchor sw
+    incr dx $blotspc
+    $arroww create image $dx $dy -image paper_orange -anchor sw
+    incr dx $blotspc
+    $arroww create image $dx $dy -image paper_yellow -anchor sw
+    incr dx $blotspc
+    $arroww create image $dx $dy -image paper_yellowgreen -anchor sw
+    incr dx $blotspc
+    $arroww create image $dx $dy -image paper_green -anchor sw
+    incr dx $blotspc
+    $arroww create text $dx $dy -text " -> Newer" -anchor sw
+}
+
+proc addcline {blots str} {
+    global canvy canvx linespc stringx blotw bloth blotspc canvw ycoord
+    global filelistfont
+    set x [expr $canvx+1]
+    set y [expr $canvy+1]
+    foreach b $blots {
+	set t [$canvw create image $x $y -image $b -anchor nw]
+	$canvw addtag blots withtag $t
+	incr x $blotspc
+    }
+    set t [$canvw create text $stringx $canvy -anchor nw -text $str \
+	      -font $filelistfont]
+    $canvw addtag strings withtag $t
+    set ycoord($str) $canvy
+    incr canvy $linespc
+    set vis [lindex [$canvw yview] 1]
+    $canvw conf -scrollregion "0 0 0 $canvy"
+    if {$vis >= 1.0} {
+	$canvw yview moveto 1
+    }
+}
+
+proc displine {groups name} {
+    global agecolors
+    set ng [lindex $groups 0]
+    set cols $agecolors($ng)
+    set blots {}
+    foreach g [lindex $groups 1] {
+	lappend blots [lindex $cols $g]
+    }
+    addcline $blots $name
+}
+
+proc dispfilelines {groups} {
+    global agecolors dirs
+    set ng [lindex $groups 0]
+    set cols $agecolors($ng)
+    set n 0
+    foreach g [lindex $groups 1] {
+	addcline [lindex $cols $g] [lindex $dirs $n]
+	incr n
+    }
+}
+
+proc ruleoff {stopped} {
+    global canvw canvy linespc ruletype
+    set y [expr $canvy + $linespc/2]
+    set color black
+    if {$stopped} {set color red}
+    $canvw create line 0 $y [$canvw cget -width] $y -width 2 -fill $color
+    incr canvy $linespc
+    set vis [lindex [$canvw yview] 1]
+    $canvw conf -scrollregion "0 0 0 $canvy"
+    if {$vis >= 1.0} {
+	$canvw yview moveto 1
+    }
+    set ruletype $stopped
+}
+
+proc updatecline {si di f} {
+    global ycoord canvw blotspc bloth blotw groups
+    global filemode dirs changed
+    if {$filemode} {
+	set fs [lindex $dirs $si]
+	set fd [lindex $dirs $di]
+	if {![info exists ycoord($fs)] || ![info exists ycoord($fd)]} return
+	set ys [expr $ycoord($fs) + 2]
+	set yd [expr $ycoord($fd) + 2]
+	set xs 2
+	set xd 2
+    } else {
+	if {![info exists ycoord($f)]} return
+	set ys [expr $ycoord($f) + 2]
+	set yd $ys
+	set xs [expr $si * $blotspc + 2]
+	set xd [expr $di * $blotspc + 2]
+    }
+    set ts [$canvw find overlapping $xs $ys \
+	    [expr $xs+$blotw-2] [expr $ys+$bloth-2]]
+    set td [$canvw find overlapping $xd $yd \
+	    [expr $xd+$blotw-2] [expr $yd+$bloth-2]]
+    if {$ts != "" && $td != ""} {
+	$canvw itemconf $td -image [$canvw itemcget $ts -image]
+        set changed 1
+    }
+    set ng [lindex $groups($f) 0]
+    set g [lindex $groups($f) 1]
+    set groups($f) [list $ng [lreplace $g $di $di [lindex $g $si]]]
+}
+
+proc refreshcline {f} {
+    global ycoord canvw blotspc bloth blotw groups
+    global agecolors changed
+    if {![info exists ycoord($f)]} return
+    set y [expr $ycoord($f) + 2]
+    set ng [lindex $groups($f) 0]
+    set cols $agecolors($ng)
+    set x 2
+    foreach g [lindex $groups($f) 1] {
+	set t [$canvw find overlapping $x $y \
+		[expr $x+$blotw-2] [expr $y+$bloth-2]]
+	if {$t != ""} {
+	    $canvw itemconf $t -image [lindex $cols $g]
+            set changed 1
+	}
+	incr x $blotspc
+    }
+}
+
+proc makepatchmenu {base} {
+    global dirs
+    menu $base.p -tearoff 0
+    set sub1 0
+    foreach d1 $dirs {
+	set any 0
+	incr sub1
+	menu $base.p.$sub1 -tearoff 0
+	foreach d2 $dirs {
+	    if {$d1 == $d2} continue
+	    set any 1
+	    $base.p.$sub1 add command -label "$d2" \
+		    -command "makepatch \"$d1\" \"$d2\""
+	}
+	if {$any} {
+	    $base.p add cascade -label "$d1 ->" -menu $base.p.$sub1
+	}
+	incr sub1
+    }
+    $base add cascade -label "Make patch" -menu $base.p
+}
+
+proc maketouchmenu {base} {
+    global dirs dirreadonly
+    menu $base.t -tearoff 0
+    set i 0
+    foreach d $dirs {
+	if {!$dirreadonly($i)} {
+	    $base.t add command -label $d -command "touchfiles \"$d\""
+	}
+	incr i
+    }
+    $base add cascade -label "Touch" -menu $base.t
+}
+
+proc readonlychange {i} {
+    global dirreadonly
+    .bar.file.t entryconf $i \
+	-state [expr {$dirreadonly($i)? "disabled": "normal"}]
+    selcurfile
+}
+
+proc makewins {} {
+    global canvw numlines linespc arroww diffbut copybut filelabel nofilecmp
+    global filemode dirs dirinterest filelistfont dirreadonly
+    global rcsflag diffiflag diffwflag diffbflag diffBflag diffdflag
+    global bgcolors
+
+    set i 0
+    foreach d $dirs {
+	set dirreadonly($i) 0
+	incr i
+    }
+
+    # Native-style menubar
+    menu .bar
+    .bar add cascade -label "File" -menu .bar.file
+
+    # File menu
+    menu .bar.file
+    .bar.file add command -label "Rediff" -command rediff
+    if {!$filemode} {
+	.bar.file add command -label "Redisplay" -command "redisplay 1"
+    }
+    set menubg [lindex [.bar.file configure -background] 4]
+    set bgcolors(1) [list $menubg $menubg]
+    set bgcolors(2) [list $menubg green "#ff8080"]
+    set bgcolors(3) [list $menubg green yellow "#ff8080"]
+    set bgcolors(4) [list $menubg green yellow orange "#ff8080"]
+    set bgcolors(5) [list $menubg green "#e0ff90" yellow orange "#ff8080"]
+
+    makepatchmenu .bar.file
+    maketouchmenu .bar.file
+    .bar.file add command -label "Exclude selection" -command exclsel
+    .bar.file add command -label "Stop" -command "set stopped 1"
+    .bar.file add separator
+    .bar.file add command -label "Quit" -command "set stopped 1; destroy ."
+
+    # Diff menu
+    set diffbut .bar.diff
+    menu $diffbut
+    .bar add cascade -label "Diff" -menu $diffbut
+    $diffbut add command -label "All" -command difffiles
+
+    # Copy menu
+    set copybut .bar.copy
+    menu $copybut
+    .bar add cascade -label "Copy/Del" -menu $copybut
+
+    # Options menu
+    menu .bar.options
+    .bar add cascade -label "Options" -menu .bar.options
+
+    .bar.options add radiobutton -label "Literal comparison" \
+	    -variable rcsflag -value " " \
+	    -state [expr {$nofilecmp? "disabled": "normal"}]
+    .bar.options add radiobutton -label "Ignore differences in RCS strings" \
+	    -variable rcsflag -value "-rcs" \
+	    -state [expr {$nofilecmp? "disabled": "normal"}]
+    .bar.options add checkbutton -label "Show files that are identical" \
+	    -variable showsame
+
+    .bar.options add checkbutton -label "Redisplay immediately" \
+	    -variable redisp_immed
+    .bar.options add checkbutton -label "Show files that aren't in some dirs" \
+	    -variable nxdirmode
+    .bar.options add checkbutton -label "Ignore files in .cvsignore" \
+	    -variable docvsignore
+    .bar.options add command -label "Excluded files..." -command exclfilelist
+    .bar.options add command -label "Diff options..." -command diffoptions
+    .bar.options add command -label "External viewers..." -command extprograms
+    .bar.options add command -label "Save options" -command saveoptions
+
+    .bar.options add separator
+    set i 0
+    foreach d $dirs {
+	set dirinterest($i) 1
+	.bar.options add checkbutton -label "Show $d" \
+		-variable dirinterest($i) -command redisplay
+	incr i
+    }
+
+    .bar.options add separator
+    set i 0
+    foreach d $dirs {
+	.bar.options add checkbutton -label "Read-only $d" \
+		-variable dirreadonly($i) -command "readonlychange $i"
+	incr i
+    }
+
+    # Help menu
+    menu .bar.help
+    .bar add cascade -label "Help" -menu .bar.help
+    .bar.help add command -label "About dirdiff" -command about
+    .bar.help add command -label "About diff" -command about_diff
+    .bar.help add command -label "Show help text" -command helptext
+
+    . configure -menu .bar
+
+    # make the filename display bar
+    if {!$filemode} {
+	frame .file -relief sunk -bd 1
+	set filelabel .file.name
+	#label $filelabel -relief flat -padx 7 -text "File: "
+	label $filelabel -relief flat -padx 7 -image paper
+        set fileentry .file.ent
+        entry $fileentry -relief sunk -bd 1 -textvariable selfile \
+               -font $filelistfont
+	pack $filelabel -side left
+	pack $fileentry -side left -fill x -expand yes
+	pack .file -side top -fill x
+    }
+
+    # make the frame containing the 2 canvases (one for the top section
+    # containing the directory names, one for the files) and the scrollbar
+    # in file mode the top section is omitted
+    frame .cf
+    if {$filemode} {
+	set numlines [llength $dirs]
+    }
+    canvas .cf.c -height [expr $numlines * $linespc] \
+	    -yscrollincr $linespc -yscrollcommand ".csb set" \
+            -bg white -relief sunk -bd 1
+    set canvw .cf.c
+    if {!$filemode} {
+	canvas .cf.d -height [expr 3 * $linespc] \
+               -relief flat -bd 1 -highlightthickness 0
+	set arroww .cf.d
+	pack .cf.d -side top -fill x
+    }
+    pack .cf.c -side bottom -fill both -expand 1
+    scrollbar .csb -command "$canvw yview" -highlightthickness 0
+    pack .csb -side right -fill y
+    pack .cf -side left -fill both -expand 1
+
+    if {!$filemode} {
+	bind $fileentry <Return> "search_canvas"
+    }
+    # set up event bindings on the main canvas
+    bind $canvw <1> {selcanvline %x %y 0}
+    bind $canvw <Shift-1> {selcanvline %x %y 1}
+    bind $canvw <B1-Motion> {selcanvline %x %y 2}
+    bind $canvw <Control-1> {selcanvline %x %y 3}
+    # This caused selcurfile to always be done twice
+    #bind $canvw <ButtonRelease-1> {selcurfile}
+    bind $canvw <ButtonRelease-4> "$canvw yview scroll -5 u"
+    bind $canvw <ButtonRelease-5> "$canvw yview scroll 5 u"
+    bind $canvw <2> "$canvw scan mark 0 %y"
+    bind $canvw <B2-Motion> "$canvw scan dragto 0 %y"
+    bind $canvw <Double-Button-1> "set doubleclick 1; showsomediff 0"
+    bind $canvw <Key-Return> "showsomediff 0"
+    $canvw conf -scrollregion {0 0 0 1}
+    if {!$filemode} {
+	bind . N "diffnextfile 1"
+	bind . P "diffnextfile -1"
+    }
+    bind . C copydifffile
+    bind . <Key-Return> "showsomediff 0"
+    bind . <Key-Prior> "$canvw yview scroll -1 p"
+    bind . <Key-Next> "$canvw yview scroll 1 p"
+    bind . <Key-Delete> "$canvw yview scroll -1 p"
+    bind . <Key-BackSpace> "$canvw yview scroll -1 p"
+    bind . <Key-space> "$canvw yview scroll 1 p"
+    bind . <Key-Up> "$canvw yview scroll -1 u"
+    bind . <Key-Down> "$canvw yview scroll 1 u"
+    bind . Q "set stopped 1; destroy ."
+    # Need a way to unselect all
+    bind . <Escape> resetsel
+
+}
+
+proc about {} {
+    set w .about
+    if {[winfo exists $w]} {
+	raise $w
+	return
+    }
+    toplevel $w
+    wm title $w "About dirdiff"
+    message $w.m -text {
+Dirdiff version 2.1
+
+Copyright © 1999-2005 Paul Mackerras
+
+Use and redistribute under the terms of the GNU General Public License
+
+(CVS $Revision: 1.70 $)} \
+	    -justify center -aspect 400
+    pack $w.m -side top -fill x -padx 20 -pady 20
+    button $w.ok -text Close -command "destroy $w"
+    pack $w.ok -side bottom
+}
+
+proc about_diff {} {
+    set w .about_diff
+    if {[winfo exists $w]} {
+	raise $w
+	return
+    }
+    toplevel $w
+    wm title $w "About diff"
+    set retval [catch "exec diff -v" err]
+    message $w.m -text $err -justify center -aspect 600
+    pack $w.m -side top -fill x -padx 20 -pady 20
+    if {$retval == 0} {
+       text $w.t -bg white -yscrollcommand "$w.sb set" -wrap word
+       scrollbar $w.sb -command "$w.t yview"
+       pack $w.sb -side right -fill y
+       pack $w.t -side left -fill both -expand 1
+       set fdh [open "|diff --help" r]
+       while { [eof $fdh] == 0 } {
+          $w.t insert end "[gets $fdh]\n"
+       }
+       pack $w.t -side top -fill both -expand yes
+    }
+    button $w.ok -text Close -command "destroy $w"
+    pack $w.ok -side bottom
+}
+
+proc helptext {} {
+    set w .help
+    if {[winfo exists $w]} {
+	raise $w
+	return
+    }
+    toplevel $w
+    wm title $w "Dirdiff help"
+    text $w.t -font {Times -14} -yscrollcommand "$w.sb set" -wrap word
+    scrollbar $w.sb -command "$w.t yview"
+    pack $w.sb -side right -fill y
+    pack $w.t -side left -fill both -expand 1
+    bind $w <Key-Prior> "$w.t yview scroll -1 p"
+    bind $w <Key-BackSpace> "$w.t yview scroll -1 p"
+    bind $w <Key-Delete> "$w.t yview scroll -1 p"
+    bind $w b "$w.t yview scroll -1 p"
+    bind $w B "$w.t yview scroll -1 p"
+    bind $w <Key-Up> "$w.t yview scroll -1 u"
+    bind $w <Key-Down> "$w.t yview scroll 1 u"
+    bind $w d "$w.t yview scroll \[expr \"int(\[$w.t cget -height\]/2)\"\] u"
+    bind $w D "$w.t yview scroll \[expr \"int(\[$w.t cget -height\]/2)\"\] u"
+    bind $w u "$w.t yview scroll \[expr \"int(-\[$w.t cget -height\]/2)\"\] u"
+    bind $w U "$w.t yview scroll \[expr \"int(-\[$w.t cget -height\]/2)\"\] u"
+    bind $w q "destroy $w"
+    bind $w Q "destroy $w"
+    $w.t insert end {Dirdiff instructions.
+
+Dirdiff compares all the files in up to five directories.  There is one \
+column in the main window for each directory.
+
+Each file is shown with a coloured square indicating its status.  Files \
+are like leaves on a deciduous tree: the newest ones are green, and then \
+they turn yellow, orange, and red as they get older.
+
+Double-click a file to show differences between two versions.  By default, \
+the first and last versions are compared, but this can be changed by the \
+'Diff' menu in the main window.  
+
+You can select several files to copy or to make a patch by shift-clicking.
+
+You can search for a file by typing part of its name in the entry and \
+pressing the <Return> key.
+
+In the diff window, check the boxes on the left margin for changes you \
+want to preserve, and then choose 'Merge' to move those changes into one \
+of the files.  Alternatively, choose 'Copy' in the main window to copy \
+across the whole file, replacing any changes.
+
+'Make patch' produces a file describing the changes between the files that \
+can be applied by the patch tool.  You can edit the patch before saving, \
+and may wish to add explanatory text, instructions, or patch(1) Prereq \
+lines at the beginning.  To save the patch, enter a filename in the patch \
+window relative to the current directory, and choose 'Save'.  This will \
+also close the window.
+
+If you are sending out patches, then the "from" directory should be the \
+original version of the source.  Try to make sure that the two files have \
+the same number of leading directories.  See the patch(1) man page for \
+more information.
+    }
+
+    $w.t conf -state disabled
+}
+
+proc filediffs {} {
+    global groups selitem fserial
+    updatefileinfo .
+    set groups(.) [set gr [diffages . 1 1]]
+    set fserial(.) 1
+    dispfilelines $gr
+    clearsecsel
+    selcurfile
+}
+
+proc diffsin {sd maxdepth} {
+    global groups stopped showsame alllines nxdirmode
+    foreach f [addfiles $sd] {
+	if {$stopped} return
+	lappend alllines $f
+	set d [string trimright $f /]
+	if {$d == $f || $maxdepth <= 0} {
+	    set groups($f) [set gr [diffages $f $showsame $maxdepth]]
+	    if [interesting_line $gr] {
+		displine $gr $f
+	    }
+	} else {
+	    set groups($f) [set gr [subdirgroups $d]]
+	    if {$nxdirmode == 0 && [interesting_line $gr]} {
+		displine $gr $f
+	    }
+	    diffsin $f [expr $maxdepth-1]
+	}
+	catch update
+    }
+}
+
+proc canvdiffs {} {
+    global canvw groups stopped filemode alllines
+    global filetype filetime filesize maxdepth
+    set stopped 0
+    set alllines {}
+    catch {unset filetype}
+    catch {unset filetime}
+    catch {unset filesize}
+    initcanv
+    if {$filemode} {
+	filediffs
+    } else {
+	diffsin {} $maxdepth
+	if {[catch update]} return
+	ruleoff $stopped
+    }
+    if {[catch update]} return
+    if {[lindex [$canvw yview] 1] >= 1.0} {
+	$canvw yview moveto 0
+    }
+}
+
+proc textitemat {x y} {
+    global canvw
+    foreach i [$canvw find overlapping $x $y [expr $x+50] $y] {
+	if {[$canvw type $i] == "text"} {
+	    return $i
+	}
+    }
+    return {}
+}
+
+proc itemofname {f} {
+    global stringx ycoord linespc
+    if {![info exists ycoord($f)]} {
+	return {}
+    }
+    return [textitemat [expr {$stringx+5}] [expr {$ycoord($f) + $linespc/2}]]
+}
+
+proc addtobbox {bbox x y} {
+    set x0 [lindex $bbox 0]
+    set y0 [lindex $bbox 1]
+    set x1 [lindex $bbox 2]
+    set y1 [lindex $bbox 3]
+    if {$x < $x0} {set x0 $x}
+    if {$y < $y0} {set y0 $y}
+    if {$x > $x1} {set x1 $x}
+    if {$x > $y1} {set y1 $y}
+    return [list $x0 $y0 $x1 $y1]
+}
+
+proc selcanvline {x y tipe} {
+    global canvw stringx selitem secsel clickitem groups selfile clickmode
+    global filemode doubleclick clicky
+    if {$filemode} return
+    set x [expr $stringx+5]
+    set y [$canvw canvasy $y]
+    set it [textitemat $x $y]
+    if {$it == {}} return
+    if {$tipe == 0} {
+	# click, no shift
+	clearsecsel
+	selectitem $it
+	set clickitem $it
+	set clicky $y
+	set clickmode 1
+	selcurfile
+	addsecsel $it
+	set doubleclick 0
+    } elseif {$tipe == 1} {
+	# shift-click
+	set clickitem $it
+	set clicky $y
+	if {$it != $selitem} {
+	    if {![info exists secsel($it)]} {
+		set clickmode 1
+		addsecsel $it
+	    } else {
+		set clickmode 0
+		remsecsel $it
+	    }
+	}
+	set doubleclick 0
+    } elseif {$tipe == 2 || $tipe == 3} {
+	# motion with button 1 down
+	if {$tipe == 2 && [info exists doubleclick] && $doubleclick} return
+	if {![info exists clickitem]} return
+	foreach i [$canvw find overlapping \
+		       $x [expr {$y < $clicky? $y: $clicky}] \
+		       [expr $x+50] [expr {$y > $clicky? $y: $clicky}]] {
+	    if {[$canvw type $i] == "text"} {
+		set f [$canvw itemcget $i -text]
+		if {$groups($f) == $groups($selfile)} {
+		    if {$clickmode && ![info exists secsel($i)]} {
+			addsecsel $i
+		    } elseif {!$clickmode && [info exists secsel($i)]} {
+			remsecsel $i
+		    }
+		}
+	    }
+	}
+    }
+}
+
+proc selectitem {it} {
+    global selitem canvw
+    set selitem $it
+    $canvw select from $it 0
+    $canvw select to $it end
+}
+
+proc addsecsel {it} {
+    global canvw secsel
+    set t [eval $canvw create rect [$canvw bbox $it] -outline {{}} \
+	    -tags secsel -fill [$canvw cget -selectbackground]]
+    $canvw lower $t
+    set secsel($it) $t
+}
+
+proc remsecsel {it} {
+    global canvw secsel
+    $canvw delete $secsel($it)
+    unset secsel($it)
+}
+
+proc clearsecsel {} {
+    global canvw secsel
+    $canvw delete secsel
+    catch {unset secsel}
+}
+
+proc selnextline {inc} {
+    global canvw selitem linespc stringx canvy filemode
+    if {$filemode} {
+	if {$inc != 0} {
+	    return 0
+	}
+	selcurfile
+	return 1
+    }
+    if {$selitem == ""} {
+	return 0
+    }
+    set y [expr [lindex [$canvw bbox $selitem] 1] + $linespc * $inc + 5]
+    set x [expr $stringx+5]
+    set i [textitemat $x $y]
+    if {$i == ""} {
+	return 0
+    }
+    clearsecsel
+    selectitem $i
+    set bbox [$canvw bbox $i]
+    set y [expr {([lindex $bbox 1] + [lindex $bbox 3]) / 2.0}]
+    if {$canvy > 0} {
+	set ytop [expr {($y - $linespc / 2.0) / $canvy}]
+	set ybot [expr {($y + $linespc / 2.0) / $canvy}]
+	set wnow [$canvw yview]
+	if {$ytop < [lindex $wnow 0]} {
+	    $canvw yview moveto $ytop
+	} elseif {$ybot > [lindex $wnow 1]} {
+	    set wh [expr {[lindex $wnow 1] - [lindex $wnow 0]}]
+	    $canvw yview moveto [expr {$ybot - $wh}]
+	}
+    } else {
+	$canvw yview moveto 0
+    }
+    selcurfile
+    addsecsel $i
+    return 1
+}
+
+proc calcgroupelts {f} {
+    global groupelts numgroups groups
+    set gr $groups($f)
+    set numgroups [lindex $gr 0]
+    if {$numgroups == "dir"} {
+	set numgroups 1
+    }
+    set gr [lindex $gr 1]
+    for {set g 0} {$g <= $numgroups} {incr g} {
+	set groupelts($g) {}
+    }
+    set i 0
+    foreach g $gr {
+	lappend groupelts($g) $i
+	incr i
+    }
+}
+
+proc selcurfile {} {
+    global canvw selitem filelabel selfile groups filemode
+    global groupelts diffbut copybut numgroups
+    if {!$filemode} {
+	if {$selitem == ""} return
+	set selfile [$canvw itemcget $selitem -text]
+    } else {
+	set selfile .
+    }
+    calcgroupelts $selfile
+    set x [string trimright $selfile /]
+    if {$x == $selfile} {
+	if {[info exists filelabel]} {
+	    $filelabel conf -image paper
+	}
+	confdiffbut 0
+	confcopybutfile
+    } else {
+	if {[info exists filelabel]} {
+	    $filelabel conf -image folder
+	}
+	confdiffbut 1
+	confcopybutdir
+    }
+}
+
+proc mkdiffimage {gn go} {
+    global numgroups agecolors
+    set cols $agecolors($numgroups)
+    set i1 [lindex $cols $go]
+    set i2 [lindex $cols $gn]
+    set iname "icon-$i1-$i2"
+    if {![info exists $iname]} {
+	set w1 [image width $i1]
+	set w2 [image width $i2]
+	set h [image height $i1]
+	image create photo $iname -width [expr {$w1+$w2}] -height $h
+	$iname copy $i1
+	$iname copy $i2 -to $w1 0
+    }
+    return $iname
+}
+
+proc confdiffbut {isdir} {
+    global diffbut numgroups dirs selfile groupelts filemode
+    global groups agecolors bgcolors compound_ok
+    $diffbut delete 0 end
+    destroy [winfo children $diffbut]
+    set ng [lindex $groups($selfile) 0]
+
+    if {$isdir} {
+	# do nothing
+    } elseif {$numgroups == 1} {
+	set xi [lindex $groupelts(1) 0]
+	if {$xi != ""} {
+	    set x [lindex $dirs $xi]
+	    $diffbut add command -label "Show $x" \
+		    -command "showfile \"$x\" \"$selfile\""
+	}
+    } elseif {$numgroups > 1} {
+	if {$numgroups > 2} {
+	    set x {}
+	    for {set gn 1} {$gn <= $numgroups} {incr gn} {
+		set i [lindex $groupelts($gn) 0]
+		lappend x [lindex $dirs $i]
+	    }
+	    $diffbut add command -label "$numgroups-way diff" \
+		-command "diffn {$x} {$selfile}"
+	}
+	for {set gn 1} {$gn < $numgroups} {incr gn} {
+	    set yi [lindex $groupelts($gn) 0]
+	    if {$yi == ""} continue
+
+            set age [lindex [lindex $groups($selfile) 1] $yi]
+            set im [lindex $agecolors($ng) $age]
+            set cl [lindex $bgcolors($ng) $age]
+	    set y [lindex $dirs $yi]
+            if {[winfo exists $diffbut.$gn]} {destroy $diffbut.$gn}
+            menu $diffbut.$gn -tearoff 0
+            set any 0
+	    for {set go [expr $gn+1]} {$go <= $numgroups} {incr go} {
+		set xi [lindex $groupelts($go) 0]
+                set age [lindex [lindex $groups($selfile) 1] $xi]
+                set im2 [lindex $agecolors($ng) $age]
+                set cl2 [lindex $bgcolors($ng) $age]
+		set xi [lindex $groupelts($go) 0]
+		if {$xi == ""} continue
+		set x [lindex $dirs $xi]
+		set cmd "diff2 \"$x\" \"$y\" \"$selfile\""
+		if {$numgroups <= 3} {
+		    if {$compound_ok} {
+			$diffbut add command -label "$x vs. $y" \
+			    -command $cmd \
+			    -image [mkdiffimage $gn $go] \
+			    -compound left
+		    } else {
+			$diffbut add command -label "$x vs. $y" \
+			    -command $cmd
+		    }
+		} else {
+		    incr any
+		    if {$compound_ok} {
+			$diffbut.$gn add command -label "$x" \
+			    -image $im2 -compound left \
+			    -command $cmd
+		    } else {
+			$diffbut.$gn add command -label "$x" \
+			    -background $cl2 \
+			    -command $cmd
+		    }
+		}
+	    }
+	    if {$any} {
+                if {$compound_ok} {
+	            $diffbut add cascade -label "$y vs. ..." \
+                       -image $im -compound left \
+		       -menu $diffbut.$gn
+	        } else {
+	            $diffbut add cascade -label "$y vs. ..." \
+                       -background $cl \
+		       -menu $diffbut.$gn
+                }
+            }
+        }
+    }
+    if {!$filemode} {
+	$diffbut add separator
+	$diffbut add command -label "Rediff selected file(s)" \
+		-command "redifffiles"
+    }
+    .bar entryconfigure 2 -state normal
+}
+
+proc mkcopyimage {i1 i2} {
+    if {$i1 == ""} {
+	return $i2
+    }
+    if {$i2 == ""} {
+	return $i1
+    }
+    set iname "icon-$i1-$i2"
+    if {![info exists $iname]} {
+	set w1 [image width $i1]
+	set w2 [image width $i2]
+	set h [image height $i1]
+	image create photo $iname -width [expr {$w1+$w2}] -height $h
+	$iname copy $i1
+	$iname copy $i2 -to $w1 0
+    }
+    return $iname
+}
+
+proc confcopybutfile {} {
+    global copybut groupelts numgroups selfile dirs
+    global groups agecolors bgcolors compound_ok dirreadonly
+    $copybut delete 0 end
+    destroy [winfo children $copybut]
+    set numdirs [llength $dirs]
+    set srcs {}
+    set rev {}
+    set ng [lindex $groups($selfile) 0]
+
+    for {set gn 1} {$gn <= $numgroups} {incr gn} {
+	set srcs [concat $srcs $groupelts($gn)]
+	set src [lindex $groupelts($gn) 0]
+	if {$src == ""} continue
+        set age [lindex [lindex $groups($selfile) 1] $src]
+        set im [lindex $agecolors($ng) $age]
+        set cl [lindex $bgcolors($ng) $age]
+
+	set x [lindex $dirs $src]
+        if {[winfo exists $copybut.new2old$src]} {destroy $copybut.new2old$src}
+	menu $copybut.new2old$src -tearoff 0
+        set dsts {}
+	for {set dst 0} {$dst < $numdirs} {incr dst} {
+	    if {!$dirreadonly($dst) && [lsearch $srcs $dst] < 0} {
+                lappend dsts $dst
+	    }
+	}
+	set any [llength $dsts]
+        if {$any} {
+	    foreach dst $dsts {
+                set age [lindex [lindex $groups($selfile) 1] $dst]
+                set im2 [lindex $agecolors($ng) $age]
+                set cl2 [lindex $bgcolors($ng) $age]
+                if {$im2 == "ex"} {set im2 ""}
+		set y [lindex $dirs $dst]
+		set cmd "copyselfile \"$src\" \"$dst\" \"$selfile\" 0"
+		if {$any == 1} {
+		    if {$compound_ok} {
+			$copybut add command -label "$x -> $y" \
+			    -command $cmd -image [mkcopyimage $im $im2] \
+			    -compound left
+		    } else {
+			$copybut add command -label "$x -> $y" \
+			    -command $cmd
+		    }
+		} elseif {$compound_ok} {
+		    $copybut.new2old$src add command -label "$y" \
+                        -image $im2 -compound left \
+			-command $cmd
+                } else {
+		    $copybut.new2old$src add command -label "$y" \
+                        -background $cl2 \
+			-command $cmd
+                }
+	    }
+	    if {$any > 1} {
+		if {$compound_ok} {
+		    $copybut add cascade -label "$x ->" \
+			-image $im -compound left \
+			-menu $copybut.new2old$src
+		} else {
+		    $copybut add cascade -label "$x ->" \
+			-background $cl \
+			-menu $copybut.new2old$src
+		}
+	    }
+        }
+    }
+    set needsep 1
+    for {set gn $numgroups} {$gn >= 1} {incr gn -1} {
+	set src [lindex $groupelts($gn) 0]
+	if {$src == ""} continue
+
+        set age [lindex [lindex $groups($selfile) 1] $src]
+        set im [lindex $agecolors($ng) $age]
+        set cl [lindex $bgcolors($ng) $age]
+	set x [lindex $dirs $src]
+        if {[winfo exists $copybut.old2new$src]} {destroy $copybut.old2new$src}
+	menu $copybut.old2new$src -tearoff 0
+	set dsts {}
+	for {set gd 1} {$gd < $gn} {incr gd} {
+	    foreach dst $groupelts($gd) {
+		if {!$dirreadonly($dst)} {
+		    lappend dsts $dst
+		}
+	    }
+	}
+        set any [llength $dsts]
+	if {$any} {
+	    if $needsep {
+		$copybut add separator
+		set needsep 0
+	    }
+	    foreach dst $dsts {
+                set age [lindex [lindex $groups($selfile) 1] $dst]
+                set im2 [lindex $agecolors($ng) $age]
+                set cl2 [lindex $bgcolors($ng) $age]
+		set y [lindex $dirs $dst]
+		set cmd "copyselfile \"$src\" \"$dst\" \"$selfile\" 1"
+		if {$any == 1} {
+		    if {$compound_ok} {
+			$copybut add command -label "$x -> $y" \
+			    -command $cmd -image [mkcopyimage $im $im2] \
+			    -compound left
+		    } else {
+			$copybut add command -label "$x -> $y" \
+			    -command $cmd
+		    }
+		} elseif {$compound_ok} {
+		    $copybut.old2new$src add command -label "$y" \
+                        -image $im2 -compound left \
+			-command $cmd
+                } else {
+		    $copybut.old2new$src add command -label "$y" \
+                        -background $cl2 \
+			-command $cmd
+                }
+	    }
+	}
+        if {$any > 1} {
+            if {$compound_ok} {
+	        $copybut add cascade -label "$x ->" \
+                    -image $im -compound left \
+                    -menu $copybut.old2new$src
+            } else {
+	        $copybut add cascade -label "$x ->" \
+                    -background $cl \
+                    -menu $copybut.old2new$src
+            }
+        }
+    }
+    if {$groupelts(0) != {}} {
+	set needsep 1
+	for {set gn 1} {$gn <= $numgroups} {incr gn} {
+	    foreach dst $groupelts($gn) {
+		if {$dirreadonly($dst)} continue
+		set x [lindex $dirs $dst]
+		if $needsep {
+		    $copybut add separator
+		    set needsep 0
+		}
+                if {$compound_ok} {
+		    $copybut add command -label "Remove from $x" \
+                        -image ex -compound left \
+			-command "removeselfile \"$dst\" \"$selfile\""
+                } else {
+		    $copybut add command -label "Remove from $x" \
+			-command "removeselfile \"$dst\" \"$selfile\""
+                }
+	    }
+	}
+    }
+    .bar entryconfigure 3 -state normal
+}
+
+proc confcopybutdir {} {
+    global copybut groupelts selfile dirs compound_ok dirreadonly
+    $copybut delete 0 end
+    set srcs $groupelts(1)
+    set dsts $groupelts(0)
+    if {$srcs != {} && $dsts != {}} {
+	foreach s $srcs {
+	    set x [lindex $dirs $s]
+	    foreach d $dsts {
+		if {$dirreadonly($d)} continue
+		set y [lindex $dirs $d]
+		$copybut add command -label "$x -> $y" \
+			-command "copyselfile \"$s\" \"$d\" \"$selfile\" 0"
+	    }
+	}
+	set needsep 1
+	foreach s $srcs {
+	    if {$dirreadonly($s)} continue
+	    set x [lindex $dirs $s]
+	    if {$needsep} {
+		$copybut add separator
+		set needsep 0
+	    }
+            if {$compound_ok} {
+	        $copybut add command -label "Remove from $x" \
+                    -image ex -compound left \
+		    -command "removeselfile \"$s\" \"$selfile\""
+            } else {
+	        $copybut add command -label "Remove from $x" \
+		    -command "removeselfile \"$s\" \"$selfile\""
+            }
+	}
+    }
+    .bar entryconfigure 3 -state normal
+}
+
+proc resetsel {} {
+    global selitem selfile filelabel diffbut copybut
+    global canvw
+    set selitem {}
+    set selfile {}
+    $canvw select clear
+    if {[info exists filelabel]} {
+	$filelabel conf -image paper
+    }
+    .bar entryconfigure 2 -state disabled
+    .bar entryconfigure 3 -state disabled
+    clearsecsel
+}
+
+proc removediffs {} {
+    global texttop textw diffing difff
+    catch {destroy $texttop}
+    catch {unset texttop}
+    catch {unset textw}
+    catch {close $difff}
+    set diffing 0
+}
+
+proc showfile {d f} {
+    global showprogram incline
+
+    set fn [joinname $d $f]
+
+    # Show the file in an external viewer
+    if { [llength $showprogram] > 0} {
+       eval "exec $showprogram \"$fn\" &"
+       return
+    }
+    # Or make our own viewer
+    global textw texttop mergebut
+    if {!([info exists textw] && [winfo exists $textw])} {
+	maketextw
+    } else {
+	raise $texttop
+    }
+    wm title $texttop "Contents of $fn"
+    $mergebut.m delete 0 end
+    $textw conf -state normal -tabs {}
+    $textw delete 0.0 end
+    set nl {}
+    set f [open $fn r]
+    set n [gets $f line]
+    while {$n >= 0} {
+	$textw insert end "$nl$line"
+	set nl "\n"
+	set n [gets $f line]
+    }
+    close $f
+    $textw conf -state disabled
+    bind $textw <1> {}
+    bind $textw <Shift-Button-1> {}
+    bind $textw <B1-Motion> {}
+    bind $textw <ButtonRelease-1> {}
+    bind $textw <B1-Leave> {}
+    bind $textw <B1-Enter> {}
+    bind $textw <2> {}
+    bind $textw <B2-Motion> {}
+    bind $textw <ButtonRelease-2> {}
+    bind $textw <Any-Button-3> {}
+    catch {unset incline}
+}
+
+proc redifffiles {} {
+    global groups showsame selfile rediffed groups filemode
+    if {$filemode} {
+	resetsel
+	canvdiffs
+	return
+    }
+    if {$selfile == {}} return
+    set files [secondarysel $selfile]
+    foreach f $files {
+	updatefileinfo $f
+	set d [string trimright $f /]
+	if {[lindex $groups($f) 0] != "dir"} {
+	    set groups($f) [diffages $f 1 0]
+	} else {
+	    set groups($f) [subdirgroups $d]
+	}
+	refreshcline $f
+    }
+    selcurfile
+    set rediffed $selfile
+}
+
+proc diff2 {d1 d2 f {orig 1}} {
+    global diffprogram nullfile
+
+    global textw groups dirs numgroups bgcolors selfile texttop
+    global difff lno diffdirs diffiflag diffwflag diffbflag diffBflag diffdflag
+    global ctxlines difffile charwidth mergebut diffcolors
+    global diffing filemode rediffed diffnewfirst underlinetabs
+    global nextlix diffndirs allf origdiffdirs difftabs
+    set diffndirs 2
+    set difftabs ""
+    set allf {0 1}
+    set group [lindex $groups($selfile) 1]
+    set i1 [lindex $group [lsearch $dirs $d1]]
+    set i2 [lindex $group [lsearch $dirs $d2]]
+    if {($i1 > $i2) == $diffnewfirst} {
+	set x $d1
+	set d1 $d2
+	set d2 $x
+	set x $i1
+	set i1 $i2
+	set i2 $x
+    }
+    set ds [list $d1 $d2]
+    if {$diffing} {
+	if {$ds == $diffdirs && $f == $difffile} return
+	catch {close $difff}
+    }
+    set diffdirs $ds
+    set difffile $f
+    if {$orig} {
+	set origdiffdirs $ds
+    }
+    if {[info exists rediffed] && $rediffed == $f} {
+	unset rediffed
+    }
+    set path1 [joinname $d1 $f]
+    set path2 [joinname $d2 $f]
+    set diffopts "-U $ctxlines $diffiflag $diffwflag $diffbflag $diffBflag $diffdflag"
+
+    if { [llength $diffprogram] > 0} {
+       eval "exec $diffprogram \"$path1\" \"$path2\" &"
+       return
+    }
+    # If we used an external diff program, its options are used.  If we didn't,
+    # we use our diffopts, and we may be in trouble.
+    set caught [catch "exec diff $diffopts $nullfile $nullfile" err]
+    if {$caught != 0} {
+       set msg "diff $diffopts\n$err\n"
+       append msg "Suggestion: Use an external diff viewer such as tkdiff or gvimdiff"
+       error_popup "$msg"
+       return
+    }
+
+    # Build a window
+    if {![info exists textw] || ![winfo exists $textw]} {
+	maketextw
+    }
+    if {$filemode} {
+	wm title $texttop "Differences: $d1 vs $d2"
+    } else {
+	wm title $texttop "Differences: $f"
+    }
+    $mergebut.m delete 0 end
+    $textw conf -state normal
+    $textw delete 0.0 end
+    set charwidth [font measure [$textw cget -font] n]
+    $textw conf -tabs "[expr 4*$charwidth] left [expr 12*$charwidth] left"
+    set x $bgcolors($numgroups)
+    $textw tag delete [$textw tag names]
+    set diffoldcolor [lindex $x $i1]
+    set diffnewcolor [lindex $x $i2]
+    $textw tag conf d0 -back $diffoldcolor
+    $textw tag conf d1 -back $diffnewcolor
+    set diffcolors [list $diffoldcolor $diffnewcolor]
+    $textw tag conf sep -back blue -fore white
+    $textw tag conf ul -underline $underlinetabs
+    $textw tag lower sep
+    bind $textw <1> "startbutspan %x %y 0"
+    bind $textw <Shift-Button-1> "startbutspan %x %y 1; break"
+    bind $textw <B1-Motion> "setbutspan %x %y"
+    bind $textw <ButtonRelease-1> "endbutspan"
+    bind $textw <B1-Leave> "startbutscroll %W %x %y; break"
+    bind $textw <B1-Enter> "endbutscroll %W %x %y; break"
+    bind $textw <2> "startdrag $textw %x %y; break"
+    bind $textw <B2-Motion> "dragdiff $textw %x %y; break"
+    bind $textw <ButtonRelease-2> "finishdrag $textw"
+    bind $textw <Any-Button-3> "togglebuts %x %y"
+
+    # Start a diff
+    set difff [open "|diff $diffopts $path1 $path2" r]
+    set diffing 1
+    set lno 1
+    set nextlix 1000
+    catch {unset oldin}
+    catch {unset newin}
+
+    global linelist
+    set linelist {{{} {} {}}}
+
+    global fcontents
+    update
+    catch {
+	set f [open $path1 r]
+	set fcontents(0) [split [read -nonewline $f] "\n"]
+	close $f
+    }
+    catch {
+	set f [open $path2 r]
+	set fcontents(1) [split [read -nonewline $f] "\n"]
+    }
+
+    global file1lnum file2lnum incline
+    set file1lnum 0
+    set file2lnum 0
+    catch {unset incline}
+    fconfigure $difff -blocking 0
+    fileevent $difff readable "readdiff $difff"
+}
+
+# linelist structure:
+# one entry per displayed line, plus a 0'th null entry (not displayed)
+# each entry is: linenumbers treenumbers line lix
+# linenumbers contains one entry per tree, {} if this line
+#  isn't in a tree's version of the file
+# treenumbers is a list of the tree numbers where this line appears,
+#  or {} for a separator line ($allf for a context line)
+# line is the actual text of the line, or for a separator line,
+#  a list of the pieces of text to appear across the separator line
+# lix is the index of the checkbutton for this line if present
+# header lines (---/+++) have linenumbers == {} and treenumbers == {}
+
+proc readdiff {f} {
+    global difff lno textw dirreadonly nextlix
+    global incline linelist
+    global file1lnum file2lnum diffing textfont
+    global fcontents allf
+    if {$f != $difff} {
+	catch {close $f}
+	return
+    }
+    set n [gets $difff line]
+    if {$n < 0} {
+	if {![eof $difff]} return
+	catch {close $difff}
+	set diffing 0
+	if {$lno > 1} {
+	    $textw delete "end - 1c" end
+	    set t [$textw tag names "end - 1l"]
+	    if {$t != ""} {
+		$textw tag add $t "end - 1l" end
+	    }
+	}
+	$textw conf -state disabled
+	if {$lno > 3} {
+	    confmergebut
+	    confmpatchbut
+	}
+	return
+    }
+    set x [string index $line 0]
+    if {$x == "@" && [regexp { -([0-9,]+) .*\+([0-9,]+) } $line z r1 r2]} {
+	set r1 [lindex [split $r1 ,] 0]
+	set r2 [lindex [split $r2 ,] 0]
+	catch {set file1lnum [expr {$r1+0}]}
+	catch {set file2lnum [expr {$r2+0}]}
+	lappend linelist [makesepline $lno [list $file1lnum $file2lnum]]
+	$textw insert end "\n"
+	redisplaylines $textw $lno 1
+	incr lno
+	return
+    }
+    set ix 1
+    if {($x == "-" || $x == "+") && $lno > 3} {
+	set lix $nextlix
+	incr nextlix
+	set incline($lix) 0
+	makecheckbox $textw $lix end
+	set ix 2
+	set line [string range $line 1 end]
+	if {$x == "-"} {
+	    lappend linelist [list [list $file1lnum {}] 0 $line $lix]
+	} else {
+	    lappend linelist [list [list {} $file2lnum] 1 $line $lix]
+	}
+    } elseif {$x == "-" || $x == "+"} {
+	set line [string trimleft $line $x]
+	lappend linelist [list {} [expr {$x == "+"}] $line]
+    } elseif {$x == " "} {
+	set line [string range $line 1 end]
+	lappend linelist [list [list $file1lnum $file2lnum] $allf $line]
+    }
+    set lbeg [$textw index "end - 1c linestart"]
+    $textw insert end "\t"
+    set r [tabexpand $line $ix]
+    $textw insert end [lindex $r 0]
+    $textw insert end "\n"
+    foreach tgp [lindex $r 1] {
+	$textw tag add ul "$lbeg + [lindex $tgp 0]c" "$lbeg + [lindex $tgp 1]c"
+    }
+    set lend [$textw index "$lbeg + 1l"]
+    if {$x == "-"} {
+	$textw tag add d0 $lbeg $lend
+    } elseif {$x == "+"} {
+	$textw tag add d1 $lbeg $lend
+    }
+    if {$x != "+"} {incr file1lnum}
+    if {$x != "-"} {incr file2lnum}
+    incr lno
+}
+
+proc confmergebut {} {
+    global mergebut diffdirs difffile
+    global groups dirs diffmtime allf dirreadonly
+    set group [lindex $groups($difffile) 1]
+    foreach i $allf {
+	set g [lindex $group [lsearch $dirs [lindex $diffdirs $i]]]
+	set k 0
+	foreach gx $group {
+	    if {$gx == $g && !$dirreadonly($k)} {
+		set f [lindex $dirs $k]
+		$mergebut.m add command -label "update $f" \
+		    -command "diffmerge $i \"$f\""
+		set path [joinname $f $difffile]
+		set diffmtime($path) [file mtime $path]
+	    }
+	    incr k
+	}
+    }
+}
+
+proc confmpatchbut {} {
+    global mpatchbut diffdirs difffile
+    global groups dirs allf dirreadonly
+    set group [lindex $groups($difffile) 1]
+    foreach i $allf {
+	set g [lindex $group [lsearch $dirs [lindex $diffdirs $i]]]
+	set k 0
+	foreach gx $group {
+	    if {$gx == $g && !$dirreadonly($k)} {
+		set f [lindex $dirs $k]
+		$mpatchbut.m add command -label "for $f" \
+		    -command "diffmpatch $i \"$f\""
+	    }
+	    incr k
+	}
+    }
+}
+
+proc makesepline {lno lnums} {
+    global linelist fcontents diffndirs
+    set plinfo [lindex $linelist [expr $lno-1]]
+    set lns [lindex $plinfo 0]
+    set gapmin [llength $fcontents(0)]
+    set gapmax 0
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set fl($i) [lindex $lnums $i]
+	set pfl [lindex $lns $i]
+	if {$pfl == {}} {set pfl 0}
+	set gap [expr $fl($i) - $pfl - 1]
+	if {$gap < $gapmin} {set gapmin $gap}
+	if {$gap > $gapmax} {set gapmax $gap}
+	set flen [llength $fcontents($i)]
+	if {$flen == 0} {
+	    set pct($i) "--"
+	} else {
+	    set pct($i) [expr {int($fl($i) * 100.0 / $flen)}]
+	}
+    }
+    set nls $gapmin
+    if {$nls != $gapmax} {
+	append nls "-$gapmax lines"
+    } elseif {$nls == 1} {
+	append nls " line"
+    } else {
+	append nls " lines"
+    }
+    set pad [expr {$diffndirs > 4? "  ": "    "}]
+    set line [list "$pad\(gap: $nls)$pad"]
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	lappend line "$pad$fl($i) ($pct($i)%)$pad"
+    }
+    return [list $lnums {} $line]
+}
+
+proc makecheckbox {w lix pos} {
+    checkbutton $w.inc$lix -variable incline($lix) \
+	-font {Courier -10} -cursor top_left_arrow \
+	-highlightthickness 0 -padx 2 -pady 0
+    $w window create $pos -window $w.inc$lix -stretch true
+    bind $w.inc$lix <1> "wstartbutspan %W %x %y; break"
+    bind $w.inc$lix <B1-Motion> "wsetbutspan %W %x %y; break"
+    bind $w.inc$lix <ButtonRelease-1> "endbutspan; break"
+    bind $w.inc$lix <Shift-Button-1> "wtogglebuts %W %x %y; break"
+    bind $w.inc$lix <Any-Button-3> "wtogglebuts %W %x %y"
+}
+
+proc tabexpand {line ix} {
+    set col 0
+    set txt {}
+    set tgs {}
+    set trailb [string length [string trimright $line]]
+    while {[set tpos [string first "\t" $line]] >= 0} {
+	if {$tpos > 0} {
+	    append txt [string range $line 0 [expr $tpos-1]]
+	    if {$trailb < $tpos} {
+		lappend tgs [list [expr $ix+$trailb] [expr $ix+$tpos]]
+		set trailb 0
+	    } else {
+		set trailb [expr $trailb-$tpos]
+	    }
+	    incr ix $tpos
+	    incr col $tpos
+	}
+	set nsp [expr {8 - ($col & 7)}]
+	append txt [string range "         " 1 $nsp]
+	lappend tgs [list $ix [expr $ix+$nsp]]
+	set line [string range $line [expr $tpos+1] end]
+	incr ix $nsp
+	incr col $nsp
+	if {$trailb > 0} {incr trailb -1}
+    }
+    append txt $line
+    set tpos [string length $line]
+    if {$trailb < $tpos} {
+	lappend tgs [list [expr $ix+$trailb] [expr $ix+$tpos]]
+    }
+    return [list $txt $tgs]
+}
+
+proc startbutspan {x y doall} {
+    global butspanstart textw linelist butspanline
+    set l [lindex [split [$textw index @$x,$y] .] 0]
+    set lix [lindex [lindex $linelist $l] 3]
+    if {$lix != {}} {
+	set butspanstart $lix
+	set butspanline $l
+	$textw.inc$lix toggle
+	if {$doall} {
+	    togglegroup $l
+	}
+    }
+}
+
+proc setbutspan {x y} {
+    global incline butspanstart textw linelist butspanline
+    global textscrollx textscrolly
+    if {![info exists butspanstart]} return
+    set lend [lindex [split [$textw index @$x,$y] .] 0]
+    set ln $butspanline
+    set textscrollx $x
+    set textscrolly $y
+    set butspanline $lend
+    if {$ln == $lend} return
+    set inc [expr {$ln < $lend? 1: -1}]
+    set m $butspanstart
+    while 1 {
+	incr ln $inc
+	set l [lindex [lindex $linelist $ln] 3]
+	if {[info exists incline($l)] && [info exists incline($m)]} {
+	    set incline($l) $incline($m)
+	}
+	if {$ln == $lend} break
+    }
+}
+
+proc endbutspan {} {
+    global butspanstart
+    catch {unset butspanstart}
+}
+
+proc wstartbutspan {w x y} {
+    incr x [winfo x $w]
+    incr y [winfo y $w]
+    startbutspan $x $y 0
+}
+
+proc wsetbutspan {w x y} {
+    incr x [winfo x $w]
+    incr y [winfo y $w]
+    setbutspan $x $y
+}
+
+proc dobutscroll {} {
+    global textscrollid textscrollx textscrolly textw
+    if {![winfo exists $textw]} return
+    if {$textscrolly < 0} {
+	$textw yview scroll -2 units
+    } elseif {$textscrolly >= [winfo height $textw]} {
+	$textw yview scroll 2 units
+    }
+    setbutspan $textscrollx $textscrolly
+    set textscrollid [after 100 dobutscroll]
+}
+
+proc startbutscroll {w x y} {
+    global textscrollx textscrolly
+    set textscrollx $x
+    set textscrolly $y
+    dobutscroll
+}
+
+proc endbutscroll {w x y} {
+    global textscrollid
+    catch {after cancel $textscrollid; unset textscrollid}
+}
+
+proc redisplaylines {w l nl} {
+    global linelist diffndirs difftabs
+    for {set i 0} {$i < $nl} {incr i} {
+	set lend [$w index "$l.0 + 1l"]
+	for {set j 0} {$j < $diffndirs} {incr j} {
+	    $w tag remove d$j $l.0 $lend
+	}
+	$w tag remove sep $l.0 $lend
+	$w delete $l.0 "$l.0 lineend"
+	set linfo [lindex $linelist $l]
+	set ty [lindex $linfo 1]
+	set line [lindex $linfo 2]
+	if {$ty == {}} {
+	    $w insert $l.0 "\t$difftabs[lindex $line 0]" sep
+	    for {set j 0} {$j < $diffndirs} {incr j} {
+		$w insert "$l.0 lineend" [lindex $line [expr $j+1]] d$j
+	    }
+	    $w insert "$l.0 lineend" "   " sep
+	    $w tag add sep "$l.0 lineend" "$l.0 + 1l"
+	} else {
+	    set nm [llength $ty]
+	    set main [lindex $ty [expr $nm-1]]
+	    set ix 0
+	    set lix [lindex $linfo 3]
+	    if {$lix != {}} {
+		catch {destroy $w.inc$lix}
+		makecheckbox $w $lix $l.0
+		incr ix
+	    }
+
+	    $w insert $l.$ix "\t$difftabs"
+	    incr ix [expr $diffndirs-1]
+	    if {$nm < $diffndirs} {
+		set sub [lindex $ty 0]
+		if {$nm <= 2} {
+		    $w tag add d$sub $l.0 $l.$ix
+		} else {
+		    set pix 0
+		    set nix [expr {$ix - $diffndirs + 3}]
+		    for {set j 0} {$j < $diffndirs-2} {incr j} {
+			set x [lindex $ty $j]
+			$w tag add d$x $l.$pix $l.$nix
+			set pix $nix
+			incr nix
+		    }
+		}
+	    }
+
+	    set x [tabexpand $line $ix]
+	    $w insert $l.$ix [lindex $x 0]
+	    foreach tgp [lindex $x 1] {
+		$w tag add ul $l.[lindex $tgp 0] $l.[lindex $tgp 1]
+	    }
+	    if {$nm < $diffndirs} {
+		set lend [$w index "$l.0 + 1l"]
+		$w tag add d$main $l.$ix $lend
+	    }
+	}
+	incr l
+    }
+}
+
+proc exchangelines {w start na nb} {
+    global linelist
+    set last [expr $start+$na+$nb-1]
+    set eltsa [lrange $linelist $start [expr $start+$na-1]]
+    set eltsb [lrange $linelist [expr $start+$na] $last]
+    set linelist [eval lreplace \$linelist $start $last $eltsb $eltsa]
+    $w conf -state normal
+    redisplaylines $w $start [expr $na+$nb]
+    $w conf -state disabled
+}
+
+proc addtoall {l x} {
+    set ret {}
+    foreach i $l {
+	lappend ret [expr {$i + $x}]
+    }
+    return $ret
+}
+
+proc subfromall {l x} {
+    set ret {}
+    foreach i $l {
+	lappend ret [expr {$i - $x}]
+    }
+    return $ret
+}
+
+proc setunion {a b} {
+    return [lsort -unique [concat $a $b]]
+}
+
+proc setintersects {a b} {
+    return [expr {[llength [setunion $a $b]] < [llength $a] + [llength $b]}]
+}
+
+# called on button 2 down in the diff window
+# start dragging a diff hunk or separator line
+proc startdrag {w x y} {
+    global dragline draglineorig draguplines dragdownlines allf
+    global dragsep dragseporig linelist dragsplit dragsplitorig
+    global diffndirs
+    set pos [$w index @$x,$y]
+    set l [lindex [split $pos .] 0]
+    $w tag remove sel 0.0 end
+    set linfo [lindex $linelist $l]
+    set ltype [lindex $linfo 1]
+    if {$ltype == {}} {
+	# dragging a separator line
+	set dragsep $l
+	set dragseporig $l
+	catch {unset dragline}
+	catch {unset dragsplit}
+	# check for a separator bar covering a single line of context
+	dragsepstart $w
+	$w tag add sel $l.0 "$l.0 + 1l"
+    } elseif {$ltype == $allf} {
+	# dragging a context line
+	set dragsplit $l
+	set dragsplitorig $l
+	catch {unset dragline}
+	catch {unset dragsep}
+	$w tag add sel $l.0 "$l.0 + 1l"
+    } else {
+	# dragging a diff line
+	set dragline $l
+	set draglineorig $l
+	catch {unset dragsep}
+	catch {unset dragsplit}
+	$w tag add sel $l.0 "$l.0 + 1l"
+    }
+}
+
+# called on movement with button 2 down in the diff window
+proc dragdiff {w x y} {
+    global dragline draglineorig linelist dragsep dragsplit
+    global diffndirs allf dragnlines
+    if {[info exists dragsep]} {
+	dragsepbar $w $x $y
+	return
+    } elseif {[info exists dragsplit]} {
+	dragdiffsplit $w $x $y
+	return
+    }
+    if {![info exists dragline]} return
+    set pos [$w index @$x,$y]
+    set l [lindex [split $pos .] 0]
+    if {$l == $dragline} return
+    $w tag remove sel 0.0 end
+    set id [lindex $linelist $dragline]
+    # t = set of trees this line is in
+    set t [lindex $id 1]
+    set dist [expr $l - $dragline]
+    while {$dist != 0} {
+	if {$dragline < $draglineorig \
+		|| ($dragline == $draglineorig && $l < $dragline)} {
+	    # moving line $dragline and lines above it of same type
+	    if {$dist < 0} {
+		# dragging upwards
+		set i [expr $dragline - 1]
+		while 1 {
+		    set pt [lindex [lindex $linelist $i] 1]
+		    if {$pt == {} || $pt == $allf \
+			    || ![setintersects $pt $t]} break
+		    set t [setunion $t $pt]
+		    incr i -1
+		}
+		set nlines [expr $dragline - $i]
+		set j $i
+		while {$i > $j + $dist} {
+		    set pt [lindex [lindex $linelist $i] 1]
+		    if {$pt == {} || $pt == $allf \
+			    || [setintersects $pt $t]} break
+		    incr i -1
+		}
+		set nabove [expr $j - $i]
+		if {$nabove > 0} {
+		    exchangelines $w [expr $i+1] $nabove $nlines
+		    incr dist $nabove
+		    for {set k 0} {$k < $nabove} {incr k} {
+			set dragnlines($dragline) $nlines
+			incr dragline -1
+		    }
+		} else {
+		    set dist 0
+		}
+	    } else {
+		# dragging back downwards
+		incr dragline
+		incr dist -1
+		set nlines $dragnlines($dragline)
+		exchangelines $w [expr {$dragline - $nlines}] $nlines 1
+	    }
+	} else {
+	    # moving line $dragline and lines below it of same type
+	    if {$dist > 0} {
+		# dragging downwards
+		set i [expr $dragline + 1]
+		while 1 {
+		    set pt [lindex [lindex $linelist $i] 1]
+		    if {$pt == {} || $pt == $allf \
+			    || ![setintersects $pt $t]} break
+		    set t [setunion $t $pt]
+		    incr i
+		}
+		set nlines [expr $i - $dragline]
+		set j $i
+		while {$i < $j + $dist} {
+		    set pt [lindex [lindex $linelist $i] 1]
+		    if {$pt == {} || $pt == $allf \
+			    || [setintersects $pt $t]} break
+		    incr i
+		}
+		set nbelow [expr $i - $j]
+		if {$nbelow > 0} {
+		    exchangelines $w $dragline $nlines $nbelow
+		    incr dist -$nbelow
+		    for {set k 0} {$k < $nbelow} {incr k} {
+			set dragnlines($dragline) $nlines
+			incr dragline
+		    }
+		} else {
+		    set dist 0
+		}
+	    } else {
+		# dragging back upwards
+		incr dragline -1
+		incr dist
+		set nlines $dragnlines($dragline)
+		exchangelines $w $dragline 1 $nlines
+	    }
+	}
+    }
+    $w tag add sel $dragline.0 "$dragline.0 + 1l"
+}
+
+# starting to drag a separator bar (button 2 down)
+proc dragsepstart {w} {
+    global dragsep linelist fcontents dragsepnowhere allf diffndirs
+    set plinfob [lindex $linelist [expr $dragsep-1]]
+    set f1lb [lindex [lindex $plinfob 0] 0]
+    set plinfo [lindex $linelist $dragsep]
+    set plns [lindex $plinfo 0]
+    set f1l [lindex $plns 0]
+    set dragsepnowhere [expr {$f1l <= $f1lb + 2}]
+    if {$f1l == $f1lb + 2} {
+	# turn the separator into a line of context
+	set line [lindex $fcontents(0) [expr {$f1l - 2}]]
+	set linelist [lreplace $linelist $dragsep $dragsep \
+			  [list [subfromall $plns 1] $allf $line]]
+	$w conf -state normal
+	redisplaylines $w $dragsep 1
+	$w conf -state disabled
+    }
+}
+
+proc dragsepbar {w x y} {
+    global dragsep dragseporig linelist fcontents dragsepnowhere allf
+    set l [lindex [split [$w index @$x,$y] .] 0]
+    if {$l == $dragsep || $dragsepnowhere} return
+    $w tag remove sel 0.0 end
+    set dist [expr $l - $dragsep]
+    while {$dist != 0} {
+	set plinfob [lindex $linelist [expr $dragsep-1]]
+	set f1lb [lindex [lindex $plinfob 0] 0]
+	set plinfo [lindex $linelist $dragsep]
+	set plns [lindex $plinfo 0]
+	set f1l [lindex $plns 0]
+	set ty [lindex $plinfo 1]
+	if {$dragsep < $dragseporig \
+		|| ($dragsep == $dragseporig && $l < $dragsep)} {
+	    # the separator bar is above its original location (or will be)
+	    set inc [expr {$dist < 0? 1: -1}]
+	    set lnums [subfromall $plns $inc]
+	    if {$ty != {}} {
+		if {$dist < 0} break
+		set lnums [addtoall $lnums 1]
+	    }
+	    set f1l [lindex $lnums 0]
+	    $w conf -state normal
+	    if {$dist < 0} {
+		# dragging further upwards
+		set line [lindex $fcontents(0) [expr $f1l-1]]
+		if {$f1lb + 2 == $f1l} {
+		    # turn the separator into an ordinary line
+		    set lns [subfromall $lnums 1]
+		    set f1ls [lindex $lns 0]
+		    set lsep [lindex $fcontents(0) [expr $f1ls-1]]
+		    set linelist [lreplace $linelist $dragsep $dragsep \
+				      [list $lns $allf $lsep] \
+				      [list $lnums $allf $line]]
+		} else {
+		    set sline [makesepline $dragsep $lnums]
+		    set linelist [lreplace $linelist $dragsep $dragsep \
+				    $sline [list $lnums $allf $line]]
+		}
+		$w insert "$dragsep.0 + 1l" "\n"
+		redisplaylines $w $dragsep 2
+		$w yview scroll 1 units
+	    } else {
+		# moving back down towards original location
+		set sline [makesepline $dragsep $lnums]
+		set linelist [lreplace $linelist $dragsep [expr $dragsep+1] \
+				  $sline]
+		$w delete "$dragsep.0 + 1l" "$dragsep.0 + 2l"
+		redisplaylines $w $dragsep 1
+		$w yview scroll -1 units
+	    }
+	    $w conf -state disabled
+	    incr dragseporig $inc
+	    incr dist $inc
+	} else {
+	    # the separator bar is below its original location (or will be)
+	    if {$dist > 0} {
+		# dragging further downwards
+		if {$ty != {}} break
+		set plnsb [lindex $plinfob 0]
+		set lnumsb [addtoall $plnsb 1]
+		set f1lb [lindex $lnumsb 0]
+		set line [lindex $fcontents(0) [expr $f1lb-1]]
+		set linelist [linsert $linelist $dragsep \
+				  [list $lnumsb $allf $line]]
+		$w conf -state normal
+		$w insert $dragsep.0 "\n"
+		redisplaylines $w $dragsep 1
+		incr dragsep
+		incr dist -1
+		if {$f1l == $f1lb + 2} {
+		    # replace separator bar by normal line
+		    set lnums [subfromall $plns 1]
+		    set f1l [lindex $lnums 0]
+		    set line [lindex $fcontents(0) [expr $f1l-1]]
+		    set linelist [lreplace $linelist $dragsep $dragsep \
+				      [list $lnums $allf $line]]
+		} else {
+		    set sline [makesepline $dragsep $plns]
+		    set linelist [lreplace $linelist $dragsep $dragsep $sline]
+		}
+		redisplaylines $w $dragsep 1
+		$w conf -state disabled
+	    } else {
+		# moving back up towards original location
+		incr dragsep -1
+		set linelist [lreplace $linelist $dragsep $dragsep]
+		$w conf -state normal
+		$w delete $dragsep.0 "$dragsep.0 + 1l"
+		# reconstruct the separator line
+		if {$ty != {}} {
+		    set plns [addtoall $plns 1]
+		}
+		set sline [makesepline $dragsep $plns]
+		set linelist [lreplace $linelist $dragsep $dragsep $sline]
+		redisplaylines $w $dragsep 1
+		$w conf -state disabled
+		incr dist
+	    }
+	}
+    }
+    $w tag add sel $dragsep.0 "$dragsep.0 + 1l"
+}
+
+# dragging a context line - splits it into -/+ versions
+proc dragdiffsplit {w x y} {
+    global dragsplit dragsplitorig linelist fcontents diffndirs
+    global nextlix incline allf
+    set pos [$w index @$x,$y]
+    set l [lindex [split $pos .] 0]
+    if {$l == $dragsplit} return
+    $w tag remove sel 0.0 end
+    set dist [expr $l - $dragsplit]
+    $w conf -state normal
+    while {$dist != 0} {
+	if {$dragsplit < $dragsplitorig \
+		|| ($dragsplit == $dragsplitorig && $l < $dragsplit)} {
+	    # moving line $dragsplit up
+	    if {$dist < 0} {
+		# split line dragsplit
+		set linfo [lindex $linelist $dragsplit]
+		if {[lindex $linfo 1] != $allf} break
+		set lns [lindex $linfo 0]
+		set newlns {}
+		for {set i 0} {$i < $diffndirs} {incr i} {
+		    lappend newlns {}
+		}
+
+		set f1l [lindex $lns 0]
+		set line1 [lindex $fcontents(0) [expr $f1l-1]]
+		set lix1 $nextlix
+		set incline($lix1) 0
+		set lnsx [lreplace $newlns 0 0 $f1l]
+		set linelist [lreplace $linelist $dragsplit $dragsplit \
+				  [list $lnsx 0 $line1 $lix1]]
+		redisplaylines $w $dragsplit 1
+
+		set l [expr $dragsplitorig + 1]
+		set deltal [expr {$l - $dragsplit}]
+
+		for {set i 1} {$i < $diffndirs} {incr i} {
+		    set fl [lindex $lns $i]
+		    set line [lindex $fcontents($i) [expr $fl-1]]
+		    set lix [incr nextlix]
+		    set incline($lix) 0
+		    set lnsx [lreplace $newlns $i $i $fl]
+		    set linelist [linsert $linelist $l \
+				      [list $lnsx $i $line $lix]]
+		    $w insert $l.0 "\n"
+		    redisplaylines $w $l 1
+		    incr l $deltal
+		}
+
+		incr nextlix
+		incr dragsplit -1
+		incr dist
+	    } else {
+		# reduce split by one line
+		incr dragsplit
+		set l [expr $dragsplitorig + 1]
+		set deltal [expr {$l - $dragsplit}]
+		set kl $dragsplit
+		set lnums {}
+		for {set k 0} {$k < $diffndirs} {incr k} {
+		    set fl [lindex [lindex [lindex $linelist $kl] 0] $k]
+		    lappend lnums $fl
+		    incr kl $deltal
+		}
+
+		set f1l [lindex $lnums 0]
+		set line1 [lindex $fcontents(0) [expr $f1l-1]]
+		set linelist [lreplace $linelist $dragsplit $dragsplit \
+				  [list $lnums $allf $line1]]
+		redisplaylines $w $dragsplit 1
+
+		incr deltal -1
+		for {set k 1} {$k < $diffndirs} {incr k} {
+		    set linelist [lreplace $linelist $l $l]
+		    $w delete $l.0 "$l.0 + 1l"
+		    incr l $deltal
+		}
+
+		incr dist -1
+	    }
+	} else {
+	    # moving line $dragsplit down
+	    if {$dist > 0} {
+		# split another line
+		set deltal [expr {$dragsplit - $dragsplitorig}]
+		set l [expr $dragsplit + ($diffndirs - 1) * $deltal]
+		set linfo [lindex $linelist $l]
+		if {[lindex $linfo 1] != $allf} break
+		set lns [lindex $linfo 0]
+		set nullns {}
+		for {set i 0} {$i < $diffndirs} {incr i} {
+		    lappend nullns {}
+		}
+
+		set l $dragsplit
+		for {set i 0} {$i < $diffndirs} {incr i} {
+		    set fl [lindex $lns $i]
+		    set line [lindex $fcontents($i) [expr $fl-1]]
+		    set lix $nextlix
+		    incr nextlix
+		    set incline($lix) 0
+		    set lnums [lreplace $nullns $i $i $fl]
+		    if {$i < $diffndirs - 1} {
+			set linelist [linsert $linelist $l \
+					  [list $lnums $i $line $lix]]
+			$w insert $l.0 "\n"
+			redisplaylines $w $l 1
+			incr l
+		    } else {
+			set linelist [lreplace $linelist $l $l \
+				  [list $lnums $i $line $lix]]
+			redisplaylines $w $l 1
+		    }
+		    incr l $deltal
+		}
+
+		incr dragsplit
+		incr dist -1
+	    } else {
+		# reduce split by one line
+		incr dragsplit -1
+		incr dist
+		set deltal [expr {$dragsplit - $dragsplitorig}]
+		set l $dragsplit
+		set lnums {}
+		for {set i 0} {$i < $diffndirs} {incr i} {
+		    lappend lnums [lindex [lindex [lindex $linelist $l] 0] $i]
+		    if {$i < $diffndirs - 1} {
+			set linelist [lreplace $linelist $l $l]
+			$w delete $l.0 "$l.0 + 1l"
+		    } else {
+			set f1l [lindex $lnums 0]
+			set line1 [lindex $fcontents(0) [expr $f1l-1]]
+			set linelist [lreplace $linelist $l $l \
+					  [list $lnums $allf $line1]]
+			redisplaylines $w $l 1
+		    }
+		    incr l $deltal
+		}
+	    }
+	    break
+	}
+    }
+    $w conf -state disabled
+}
+
+# button 2 up
+proc finishdrag {w} {
+    global dragline dragsep dragsplit
+    if {[info exists dragline]} {
+	$w tag remove sel 0.0 end
+	unset dragline
+    }
+    if {[info exists dragsep]} {
+	$w tag remove sel 0.0 end
+	unset dragsep
+    }
+    if {[info exists dragsplit]} {
+	$w tag remove sel 0.0 end
+	unset dragsplit
+    }
+}
+
+proc togglegroup {l} {
+    global incline textw linelist
+    set linfo [lindex $linelist $l]
+    set lix [lindex $linfo 3]
+    if {$lix == {}} return
+    if $incline($lix) {
+	set state select
+    } else {
+	set state deselect
+    }
+    set l0 $l
+    while 1 {
+	incr l0 -1
+	set linfo [lindex $linelist $l0]
+	set lix [lindex $linfo 3]
+	if {$lix == {}} break
+	$textw.inc$lix $state
+    }
+    set l1 $l
+    while 1 {
+	incr l1
+	set linfo [lindex $linelist $l1]
+	set lix [lindex $linfo 3]
+	if {$lix == {}} break
+	$textw.inc$lix $state
+    }
+}
+
+proc togglebuts {x y} {
+    global textw linelist
+    set l [lindex [split [$textw index @$x,$y] .] 0]
+    set lix [lindex [lindex $linelist $l] 3]
+    if {$lix != {}} {
+	$textw.inc$lix toggle
+	togglegroup $l
+    }
+}
+
+proc wtogglebuts {w x y} {
+    incr x [winfo x $w]
+    incr y [winfo y $w]
+    togglebuts $x $y
+}
+
+proc invertbuttons {} {
+    global incline textw
+    foreach l [array names incline] {
+	set incline($l) [expr {1 - $incline($l)}]
+    }
+}
+
+proc changeunderlinetabs {} {
+    global textw underlinetabs
+    $textw tag conf ul -underline $underlinetabs
+}
+
+proc diffn {dirlist f {orig 1}} {
+    global diffing diffdirs difffile difffds diffrel allf
+    global difflnos diffndirs diffstate difflnum nextdiffhdr diffhdr
+    global diffiflag diffwflag diffbflag diffdflag incline
+    global diffblocked fcontents ldisp havediffs nextlix origdiffdirs
+
+    if {$orig} {
+	set origdiffdirs $dirlist
+    }
+    # reverse the list so we have oldest first
+    set x {}
+    for {set i [llength $dirlist]} {[incr i -1] >= 0} {} {
+	lappend x [lindex $dirlist $i]
+    }
+    set dirlist $x
+    if {$diffing} {
+	if {$dirlist == $diffdirs && $f == $difffile} return
+	foreach i [array names difffds] {
+	    catch {close $difffds($i)}
+	}
+    }
+    set diffdirs $dirlist
+    set difffile $f
+    set diffndirs [llength $dirlist]
+    set nextdiffhdr 0
+    catch {unset diffhdr}
+    set havediffs 0
+    set nextlix 1000
+    catch {unset incline}
+
+    set diffopts "-u $diffiflag $diffwflag $diffbflag $diffdflag"
+    set d [lindex $dirlist 0]
+    set p [joinname $d $f]
+    set diffrel(0) 0
+    set allf 0
+    for {set j 1} {$j < $diffndirs} {incr j} {
+	set e [lindex $dirlist $j]
+	set q [joinname $e $f]
+	set difflnos($j) {0 0}
+	set diffstate($j) 0
+	set difflnum($j) 0
+	set diffblocked($j) 0
+	set diffrel($j) 0
+	set fd [open "|diff $diffopts $p $q" r]
+	set difffds($j) $fd
+	fconfigure $fd -blocking 0
+	fileevent $fd readable "readndiff $fd $j"
+	lappend allf $j
+    }
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set ldisp($i) 0
+    }
+
+    # Build a window
+    global textw filemode mergebut mpatchbut bgcolors numgroups
+    global groups dirs difftabs linelist texttop underlinetabs
+    global diffcolors
+    if {![info exists textw] || ![winfo exists $textw]} {
+	maketextw
+    }
+    if {$filemode} {
+	wm title $texttop "Differences: all files"
+    } else {
+	wm title $texttop "Differences: $f"
+    }
+    $mergebut.m delete 0 end
+    $mpatchbut.m delete 0 end
+    $textw conf -state normal
+    $textw delete 0.0 end
+    set charwidth [font measure [$textw cget -font] n]
+    set tlist "[expr 4*$charwidth] left"
+    set difftabs ""
+    set j 4
+    for {set i 2} {$i < $diffndirs} {incr i} {
+	incr j 2
+	if {$diffndirs < 4} {
+	    incr j
+	}
+	append tlist " [expr $j*$charwidth] left"
+	append difftabs "\t"
+    }
+    incr j 8
+    append tlist " [expr $j*$charwidth] left"
+    $textw conf -tabs $tlist
+    set x $bgcolors($numgroups)
+    $textw tag delete [$textw tag names]
+    set group [lindex $groups($f) 1]
+    set diffcolors {}
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set d [lindex $diffdirs $i]
+	set j [lindex $group [lsearch $dirs $d]]
+	set c [lindex $x $j]
+	$textw tag conf d$i -back $c
+	lappend diffcolors $c
+    }
+    $textw tag conf sep -back blue -fore white
+    $textw tag conf ul -underline $underlinetabs
+    $textw tag lower sep
+    bind $textw <1> "startbutspan %x %y 0; break"
+    bind $textw <Shift-Button-1> "startbutspan %x %y 1; break"
+    bind $textw <B1-Motion> "setbutspan %x %y; break"
+    bind $textw <ButtonRelease-1> "endbutspan; break"
+    bind $textw <B1-Leave> "startbutscroll %W %x %y; break"
+    bind $textw <B1-Enter> "endbutscroll %W %x %y; break"
+    bind $textw <2> "startdrag $textw %x %y; break"
+    bind $textw <B2-Motion> "dragdiff $textw %x %y; break"
+    bind $textw <ButtonRelease-2> "finishdrag $textw"
+    bind $textw <Any-Button-3> "togglebuts %x %y"
+    set linelist {{{} {} {}}}
+
+    # read in the files
+    set i 0
+    foreach d $dirlist {
+	set p [joinname $d $f]
+	set fcontents($i) {}
+	if {[catch {
+	    set fd [open $p r]
+	    set fcontents($i) [split [read -nonewline $fd] "\n"]
+	    close $fd
+	} err]} {
+	    puts "error reading $p: $err"
+	}
+	incr i
+    }
+}
+
+proc readndiff {fd ix} {
+    global difflnos diffeof difflnum diffhdr
+    global nextdiffhdr diffstate diffhunk
+    global parthunklen parthunkstart diffblocked
+
+    set n [gets $fd line]
+    set l [incr difflnum($ix)]
+    if {$n < 0} {
+	if {![eof $fd]} return
+	#puts "eof for $ix"
+	addhunk $ix 2
+	close $fd
+	return
+    }
+    set x [string index $line 0]
+    if {$l <= 2} {
+	# expect --- or +++ line or "Binary files ..."
+	if {$ix == 1 && $x == "-"} {
+	    set diffhdr(0) [string range $line 4 end]
+	}
+	if {$x == "+"} {
+	    set diffhdr($ix) [string range $line 4 end]
+	}
+	while {[info exists diffhdr($nextdiffhdr)]} {
+	    emithdr $nextdiffhdr $diffhdr($nextdiffhdr)
+	    incr nextdiffhdr
+	}
+	return
+    }
+    if {$x == "-" || $x == "+"} {
+	set addit [expr {$x == "+"}]
+	set line [string range $line 1 end]
+	if {$diffstate($ix) == 0} {
+	    # start of a new hunk of diff
+	    set parthunklen($ix,0) 0
+	    set parthunklen($ix,1) 0
+	    set parthunkstart($ix) $difflnos($ix)
+	    if {[info exists diffhunk($ix)]} {
+		# block this diff for now
+		fileevent $fd readable {}
+		set diffblocked($ix) 1
+		#puts "blocking $ix"
+	    }
+	    set diffstate($ix) 1
+	}
+	set fl [lindex $difflnos($ix) $addit]
+	incr parthunklen($ix,$addit)
+	set difflnos($ix) [lreplace $difflnos($ix) $addit $addit [incr fl]]
+    } else {
+	if {$diffstate($ix) == 1} {
+	    # end of a new hunk of diff
+	    addhunk $ix 0
+	}
+	set f0l [lindex $difflnos($ix) 0]
+	set f1l [lindex $difflnos($ix) 1]
+	if {$x == "@" && [regexp { -([0-9,]+) .*\+([0-9,]+) } $line z r1 r2]} {
+	    set r1 [lindex [split $r1 ,] 0]
+	    set r2 [lindex [split $r2 ,] 0]
+	    catch {set f0l [expr {$r1+0}]}
+	    catch {set f1l [expr {$r2+0}]}
+	} else {
+	    incr f0l
+	    incr f1l
+	}
+	set difflnos($ix) [list $f0l $f1l]
+    }
+}
+
+proc addhunk {ix newstate} {
+    global diffstate parthunklen parthunkstart diffhunk
+    #puts "addhunk $ix newstate=$newstate diffstate($ix)=$diffstate($ix)"
+    if {$diffstate($ix) == 1} {
+	#puts "   start=$parthunkstart($ix) len= $parthunklen($ix,0) $parthunklen($ix,1)"
+	if {[info exists diffhunk($ix)]} {
+	    puts "oops, overwriting hunk for $ix"
+	}
+	set diffhunk($ix) [list $parthunkstart($ix) \
+			       $parthunklen($ix,0) $parthunklen($ix,1)]
+    }
+    set diffstate($ix) $newstate
+    processhunks
+}
+
+proc consumehunk {ix} {
+    global diffhunk diffblocked difffds
+    #puts "consumehunk $ix"
+    unset diffhunk($ix)
+    if {$diffblocked($ix)} {
+	set fd $difffds($ix)
+	fileevent $fd readable "readndiff $fd $ix"
+	set diffblocked($ix) 0
+    }
+}
+
+proc diffstart {lno} {
+    global hunkstart hunkend diffndirs diffrel
+    #puts -nonewline "diffstart $lno:"
+    for {set j 0} {$j < $diffndirs} {incr j} {
+	set hunkstart($j) [expr $lno + $diffrel($j)]
+	set hunkend($j) $hunkstart($j)
+	#puts -nonewline " $hunkstart($j)"
+    }
+    #puts ""
+}
+
+proc adddiffhunk {ix} {
+    global hunkend diffndirs diffhunk
+    #puts "adddiffhunk $ix: $diffhunk($ix)"
+    set stl [lindex $diffhunk($ix) 0]
+    set lst [lindex $stl 0]
+    set rst [lindex $stl 1]
+    set llen [lindex $diffhunk($ix) 1]
+    set rlen [lindex $diffhunk($ix) 2]
+    set lend [expr $lst + $llen]
+    set rend [expr $rst + $rlen]
+    set x [expr $lend - $hunkend(0)]
+    if {$x < 0} {
+	set rend [expr $rend - $x]
+    } elseif {$x > 0} {
+	for {set i 0} {$i < $diffndirs} {incr i} {
+	    incr hunkend($i) $x
+	}
+    }
+    set hunkend($ix) $rend
+}
+
+proc addoverlaps {} {
+    global diffhunk hunkend diffndirs diffstate
+    set overlap 0
+    for {set j 1} {$j < $diffndirs} {incr j} {
+	if {![info exists diffhunk($j)]} continue
+	set lnos [lindex $diffhunk($j) 0]
+	if {[lindex $lnos 0] <= $hunkend(0) || \
+		[lindex $lnos 1] <= $hunkend($j)} {
+	    set overlap 1
+	    adddiffhunk $j
+	    consumehunk $j
+	}
+    }
+    return $overlap
+}
+
+proc processhunks {} {
+    global diffhunk diffstate diffndirs diffrel
+    global havediffs hunkstart hunkend
+
+    while 1 {
+	if {$havediffs} {
+	    addoverlaps
+	}
+
+	# check that we have a hunk or EOF for each pair
+	set alleof 1
+	for {set j 1} {$j < $diffndirs} {incr j} {
+	    if {$diffstate($j) != 2} {
+		set alleof 0
+		if {![info exists diffhunk($j)]} return
+	    }
+	}
+	#if {$alleof} {puts "processhunks: eof on all"}
+
+	if {$havediffs} {
+	    putdiffhunks
+	    #puts -nonewline "diffrel:"
+	    for {set j 1} {$j < $diffndirs} {incr j} {
+		set diffrel($j) [expr $hunkend($j) - $hunkend(0)]
+		#puts -nonewline " $diffrel($j)"
+	    }
+	    #puts ""
+	    set havediffs 0
+	    unset hunkstart
+	    unset hunkend
+	}
+
+	# find which hunk is the earliest
+	set first {}
+	for {set j 1} {$j < $diffndirs} {incr j} {
+	    if {[info exists diffhunk($j)]} {
+		set st0 [lindex [lindex $diffhunk($j) 0] 0]
+		if {$first == {} || $st0 < $earliest} {
+		    set first $j
+		    set earliest $st0
+		}
+	    }
+	}
+	if {$first == {}} {
+	    # have reached EOF on all diffs
+	    ndiffdone
+	    return
+	}
+
+	set havediffs 1
+	diffstart $earliest
+	adddiffhunk $first
+	consumehunk $first
+    }
+}
+
+proc existingmatch {matches f fl} {
+    global diffndirs
+    foreach m $matches {
+	if {$f == [lindex $m 0]} {
+	    set nl [lindex $m 2]
+	    set lnos [lindex $m 1]
+	    set o [expr [lindex $fl 0] - [lindex $lnos 0]]
+	    if {$o < 0 || $o >= $nl} {
+		return 0
+	    }
+	    for {set i 0} {$i < [llength $f]} {incr i} {
+		if {[lindex $fl $i] != [lindex $lnos $i] + $o} {
+		    return 0
+		}
+	    }
+	    return 1
+	}
+    }
+    return 0
+}
+
+# f is a list of file indices, fl is a corresponding list of line numbers
+# relative to the start of this section
+proc matchlength {f fl} {
+    global difflines
+    set l0 [lindex $fl 0]
+    set f0 [lindex $f 0]
+    set f0len [llength $difflines($f0)]
+    set nf [llength $f]
+    set len 1
+    while {[incr l0] < $f0len} {
+	set line [lindex $difflines($f0) $l0]
+	for {set i 1} {$i < $nf} {incr i} {
+	    set fi [lindex $f $i]
+	    set li [expr [lindex $fl $i] + $len]
+	    if {$li >= [llength $difflines($fi)] || \
+		    [lindex $difflines($fi) $li] != $line} {
+		return $len
+	    }
+	}
+	incr len
+    }
+    return $len
+}
+
+# m is a match expressed as a list {files lines length}
+# existing is a list of matches in that format
+proc expandmatchback {m existing} {
+    global difflines
+    set fi [lindex $m 0]
+    set fl [lindex $m 1]
+    set len [lindex $m 2]
+    set f0 [lindex $fi 0]
+    set l0 [lindex $fl 0]
+    set nf [llength $fi]
+    for {set j 0} {$j < $nf} {incr j} {
+	set f [lindex $fi $j]
+	set l [lindex $fl $j]
+	set lno($f) $l
+	set minlno($f) 0
+    }
+    foreach e $existing {
+	set k 0
+	foreach ef [lindex $e 0] {
+	    if {[info exists lno($ef)]} {
+		set el [lindex [lindex $e 1] $k]
+		if {$el < $lno($ef)} {
+		    incr el [lindex $e 2]
+		    if {$el > $minlno($ef)} {
+			set minlno($ef) $el
+		    }
+		}
+	    }
+	    incr k
+	}
+    }
+    set nl [expr $l0 - $minlno($f0)]
+    for {set x 1} {$x <= $nl} {incr x} {
+	set line [lindex $difflines($f0) [expr $l0 - $x]]
+	for {set j 1} {$j < $nf} {incr j} {
+	    set f [lindex $fi $j]
+	    set l [expr [lindex $fl $j] - $x]
+	    if {$l < $minlno($f)} break
+	    if {[lindex $difflines($f) $l] != $line} break
+	}
+	if {$j < $nf} break
+    }
+    if {$x == 1} {
+	return $m
+    }
+    set newfl {}
+    incr x -1
+    foreach l $fl {
+	lappend newfl [expr $l - $x]
+    }
+    return [list $fi $newfl [expr $len + $x]]
+}
+
+proc removematches {matches f l nl} {
+    set new {}
+    set el [expr $l + $nl]
+    foreach m $matches {
+	set i [lsearch [lindex $m 0] $f]
+	if {$i < 0} {
+	    lappend new $m
+	} else {
+	    set lm [lindex [lindex $m 1] $i]
+	    set elm [expr [lindex $m 2] + $lm]
+	    if {$el <= $lm || $elm <= $l} {
+		lappend new $m
+	    } else {
+		if {$lm < $l} {
+		    lappend new [lreplace $m 2 2 [expr $l - $lm]]
+		}
+		if {$elm > $el} {
+		    set inc [expr $el - $lm]
+		    set lnos {}
+		    foreach x [lindex $m 1] {
+			lappend lnos [expr $x + $inc]
+		    }
+		    lappend new [lreplace $m 1 2 $lnos [expr $elm - $el]]
+		}
+	    }
+	}
+    }
+    return $new
+}
+
+proc removeinversions {matches bm} {
+    set bf [lindex $bm 0]
+    set bl [lindex $bm 1]
+    set new {}
+    foreach m $matches {
+	set isbefore 0
+	set isafter 0
+	set i 0
+	set mf [lindex $m 0]
+	set ml [lindex $m 1]
+	foreach f $mf {
+	    set j [lsearch -exact $bf $f]
+	    if {$j >= 0} {
+		if {[lindex $ml $i] < [lindex $bl $j]} {
+		    set isbefore 1
+		} else {
+		    set isafter 1
+		}
+	    }
+	    incr i
+	}
+	if {!($isbefore && $isafter)} {
+	    lappend new $m
+	}
+    }
+    return $new
+}
+
+proc overlapsbest {bestmatches mf ml mlen} {
+    foreach bm $bestmatches {
+	set bf [lindex $bm 0]
+	set bl [lindex $bm 1]
+	set blen [lindex $bm 2]
+	set isbefore 0
+	set isafter 0
+	set i 0
+	foreach f $mf {
+	    set j [lsearch -exact $bf $f]
+	    if {$j >= 0} {
+		set li [lindex $ml $i]
+		set lj [lindex $bl $j]
+		if {$li < $lj} {
+		    if {$isafter || $li + $mlen > $lj} {
+			return 1
+		    }
+		    set isbefore 1
+		} else {
+		    if {$isbefore || $lj + $blen > $li} {
+			return 1
+		    }
+		    set isafter 1
+		}
+	    }
+	    incr i
+	}
+    }
+    return 0
+}
+
+proc findbestmatch {matches} {
+    set best 0
+    set bestnf 0
+    set bm {}
+    foreach m $matches {
+	set nf [llength [lindex $m 0]]
+	set good [lindex $m 2]
+	if {$nf > $bestnf || ($nf == $bestnf && $good > $best)} {
+	    set best $good
+	    set bestnf $nf
+	    set bm $m
+	}
+    }
+    return $bm
+}
+
+proc findmatches {} {
+    global hunkstart hunkend diffndirs
+    global difflines fcontents lineinst diffwflag diffbflag
+    set matches {}
+    catch {unset lineinst}
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set difflines($i) {}
+	for {set j $hunkstart($i)} {$j < $hunkend($i)} {incr j} {
+	    set line [lindex $fcontents($i) [expr $j-1]]
+	    if {$diffwflag != ""} {
+		regsub -all {[ 	]+} $line {} line
+	    } elseif {$diffbflag != ""} {
+		regsub -all {[ 	]+} $line { } line
+		regsub { $} $line {} line
+	    }
+	    lappend difflines($i) $line
+	}
+    }
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set l 0
+	foreach line $difflines($i) {
+	    lappend lineinst($line) [list $i $l]
+	    if {![regexp {^[[:space:]]*$} $line]} {
+		foreach inst $lineinst($line) {
+		    set f [lindex $inst 0]
+		    if {$f == $i || [lsearch -exact $f $i] >= 0} continue
+		    set fl [lindex $inst 1]
+		    lappend f $i
+		    lappend fl $l
+		    if {![existingmatch $matches $f $fl]} {
+			lappend matches [list $f $fl [matchlength $f $fl]]
+		    }
+		    lappend lineinst($line) [list $f $fl]
+		}
+	    }
+	    incr l
+	}
+    }
+    set bestmatches {}
+    while {$matches != {}} {
+	set bm [findbestmatch $matches]
+	set bm [expandmatchback $bm $bestmatches]
+	lappend bestmatches $bm
+	set i 0
+	set nl [lindex $bm 2]
+	foreach f [lindex $bm 0] {
+	    set lno [lindex [lindex $bm 1] $i]
+	    set matches [removematches $matches $f $lno $nl]
+	    incr i
+	}
+	set matches [removeinversions $matches $bm]
+    }
+
+    # now add in the blank-line matches that we ignored before
+    set matches {}
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set l 0
+	foreach line $difflines($i) {
+	    if {[regexp {^[[:space:]]*$} $line]} {
+		foreach inst $lineinst($line) {
+		    set f [lindex $inst 0]
+		    if {$f >= $i || [lsearch -exact $f $i] >= 0} continue
+		    set fl [lindex $inst 1]
+		    lappend f $i
+		    lappend fl $l
+		    if {![existingmatch $matches $f $fl]} {
+			set mlen [matchlength $f $fl]
+			if {![overlapsbest $bestmatches $f $fl $mlen]} {
+			    lappend matches [list $f $fl $mlen]
+			}
+		    }
+		    lappend lineinst($line) [list $f $fl]
+		}
+	    }
+	    incr l
+	}
+    }
+    while {$matches != {}} {
+	set bm [findbestmatch $matches]
+	lappend bestmatches $bm
+	set i 0
+	set nl [lindex $bm 2]
+	foreach f [lindex $bm 0] {
+	    set lno [lindex [lindex $bm 1] $i]
+	    set matches [removematches $matches $f $lno $nl]
+	    incr i
+	}
+	set matches [removeinversions $matches $bm]
+    }
+	
+    #puts "best matches: $bestmatches"
+    return $bestmatches
+}
+
+proc filematches {matches i nlines} {
+    global hunkstart hunkend diffndirs
+    set res {}
+    foreach m $matches {
+	set k [lsearch -exact [lindex $m 0] $i]
+	if {$k >= 0} {
+	    set l [lindex [lindex $m 1] $k]
+	    set e [expr $l + [lindex $m 2]]
+	    lappend res [list $l $e $m]
+	}
+    }
+    set full {}
+    set ld 0
+    foreach m [lsort -integer -index 0 $res] {
+	set l [lindex $m 0]
+	if {$ld < $l} {
+	    lappend full [list $ld $l [list $i $ld [expr $l - $ld]]]
+	}
+	if {[lindex [lindex [lindex $m 2] 0] 0] == $i} {
+	    lappend full $m
+	}
+	set ld [lindex $m 1]
+    }
+    if {$ld < $nlines} {
+	lappend full [list $ld $nlines [list $i $ld [expr $nlines - $ld]]]
+    }
+    #puts "filematches $i -> {$full}"
+    return $full
+}
+
+proc putdiffhunks {} {
+    global hunkstart hunkend diffndirs
+    global matchlist fcontents
+    #puts -nonewline "putdiffhunks"
+    #for {set i 0} {$i < $diffndirs} {incr i} {
+	#puts -nonewline " $i: ($hunkstart($i),$hunkend($i))"
+    #}
+    #puts ""
+    set matches [findmatches]
+    #puts "matches: $matches"
+    set totsegs 0
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set nlines($i) [expr $hunkend($i) - $hunkstart($i)]
+	set displ($i) [filematches $matches $i $nlines($i)]
+	set nsegs($i) [llength $displ($i)]
+	set ix($i) 0
+	if {$nsegs($i) > 0} {
+	    set curseg($i) [lindex $displ($i) 0]
+	    incr totsegs $nsegs($i)
+	}
+	set nextline($i) 0
+    }
+    set displist {}
+    while {$totsegs > 0} {
+	for {set i 0} {$i < $diffndirs} {incr i} {
+	    if {$nsegs($i) == 0} continue
+	    set m [lindex $curseg($i) 2]
+	    set blocked 0
+	    set k 0
+	    set lnos [lindex $m 1]
+	    foreach f [lindex $m 0] {
+		set l [lindex $lnos $k]
+		if {$l > $nextline($f)} {
+		    set blocked 1
+		    break
+		}
+		if {$l < $nextline($f)} {
+		    puts "oops, misordered span for $i {$curseg($i)}"
+		    #puts -nonewline "nextline: "
+		    #for {set z 0} {$z < $diffndirs} {incr z} {
+			#puts -nonewline " $nextline($z)"
+		    #}
+		    #puts -nonewline "\nix: "
+		    #for {set z 0} {$z < $diffndirs} {incr z} {
+			#puts -nonewline " $ix($z)"
+		    #}
+		    #puts -nonewline "\nnsegs: "
+		    #for {set z 0} {$z < $diffndirs} {incr z} {
+			#puts -nonewline " $nsegs($z)"
+		    #}
+		    #puts ""
+		    #for {set z 0} {$z < $diffndirs} {incr z} {
+			#puts "displ($z): {$displ($z)}"
+		    #}
+		    #puts "displist:"
+		    #foreach z $displist {
+			#puts "  $z"
+		    #}
+		    #puts ""
+		}
+		incr k
+	    }
+	    if {!$blocked} {
+		lappend displist $curseg($i)
+		set nl [lindex $m 2]
+		foreach f [lindex $m 0] {
+		    incr nextline($f) $nl
+		}
+		incr ix($i)
+		incr nsegs($i) -1
+		if {$nsegs($i) > 0} {
+		    set curseg($i) [lindex $displ($i) $ix($i)]
+		} else {
+		    unset curseg($i)
+		}
+		break
+	    }
+	}
+	incr totsegs -1
+    }
+    #puts "displist:"
+    #foreach d $displist {
+	#puts $d
+    #}
+    emitstart
+    foreach d $displist {
+	set l [lindex $d 0]
+	set e [lindex $d 1]
+	set m [lindex $d 2]
+	set fs [lindex $m 0]
+	set i [lindex $fs 0]
+	set fl [expr $hunkstart($i) + $l - 1]
+	for {} {$l < $e} {incr l} {
+	    emitdiff $fs [lindex $fcontents($i) $fl]
+	    incr fl
+	}
+    }
+}
+
+proc emithdr {i line} {
+    global textw difftabs linelist
+    $textw insert end "\t$difftabs$line\n" d$i
+    lappend linelist [list {} {} $line]
+}
+
+proc emitctxline {} {
+    global textw linelist ldisp fcontents difftabs diffndirs
+    set lnums {}
+    set memb {}
+    set line [lindex $fcontents(0) [expr $ldisp(0)-1]]
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	lappend lnums $ldisp($i)
+	incr ldisp($i)
+	lappend memb $i
+    }
+    lappend linelist [list $lnums $memb $line]
+    set ix [expr $diffndirs-1]
+    set r [tabexpand $line $ix]
+    set l [lindex [split [$textw index "end - 1c"] .] 0]
+    $textw insert end "\t$difftabs[lindex $r 0]\n"
+    foreach tgp [lindex $r 1] {
+	$textw tag add ul $l.[lindex $tgp 0] $l.[lindex $tgp 1]
+    }
+}
+
+proc emitstart {} {
+    global diffndirs ctxlines ldisp textw difftabs linelist
+    global prevhunkend fcontents hunkstart
+    set nctx $ctxlines
+    set needsep 1
+    if {[info exists prevhunkend]} {
+	if {$hunkstart(0) - $prevhunkend <= 2 * $ctxlines + 1} {
+	    set nctx [expr $hunkstart(0) - $prevhunkend]
+	    set needsep 0
+	} else {
+	    for {set l 0} {$l < $ctxlines} {incr l} {
+		emitctxline
+	    }
+	}
+    }
+    if {$nctx >= $hunkstart(0)} {
+	set nctx [expr $hunkstart(0) - 1]
+    }
+    if {$needsep} {
+	set lnums {}
+	for {set i 0} {$i < $diffndirs} {incr i} {
+	    set ldisp($i) [expr $hunkstart($i) - $nctx]
+	    lappend lnums $ldisp($i)
+	}
+	set l [llength $linelist]
+	lappend linelist [makesepline $l $lnums]
+	$textw insert end "\n"
+	redisplaylines $textw $l 1
+    }
+    for {set l 0} {$l < $nctx} {incr l} {
+	emitctxline
+    }
+}
+
+proc emitdiff {set line} {
+    global diffndirs ldisp textw difftabs linelist
+    global prevhunkend fcontents nextlix incline
+    #puts -nonewline "emitdiff set={$set} ldisp ="
+    #for {set i 0} {$i < $diffndirs} {incr i} {puts -nonewline " $ldisp($i)"}
+    #puts " line={$line}"
+    set nm [llength $set]
+    if {$nm == $diffndirs} {
+	emitctxline
+	return
+    }
+    if {$nm == 0 || $nm > $diffndirs} {
+	#puts "oops, $nm members in emitdiff?"
+	return
+    }
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	set isin($i) 0
+    }
+    foreach i $set {
+	set isin($i) 1
+    }
+    set lnums {}
+    for {set i 0} {$i < $diffndirs} {incr i} {
+	if {$isin($i)} {
+	    lappend lnums $ldisp($i)
+	    incr ldisp($i)
+	} else {
+	    lappend lnums {}
+	}
+    }
+    set lix $nextlix
+    incr nextlix
+    set incline($lix) 0
+    set l [llength $linelist]
+    lappend linelist [list $lnums $set $line $lix]
+    $textw insert end "\n"
+    redisplaylines $textw $l 1
+    set prevhunkend $ldisp(0)
+}
+
+proc ndiffdone {} {
+    global textw prevhunkend fcontents ctxlines
+    global diffing ldisp diffndirs
+    #puts -nonewline "ldisp ="
+    #for {set i 0} {$i < $diffndirs} {incr i} {puts -nonewline " $ldisp($i)"}
+    #puts ""
+    if {[info exists prevhunkend]} {
+	set l0 [llength $fcontents(0)]
+	#puts "ndiffdone, prevhunkend=$prevhunkend l0=$l0 ctxlines=$ctxlines"
+	set nctx $ctxlines
+	if {$prevhunkend - 1 + $nctx > $l0} {
+	    set nctx [expr $l0 - $prevhunkend + 1]
+	}
+	for {set l 0} {$l < $nctx} {incr l} {
+	    emitctxline
+	}
+	unset prevhunkend
+    } else {
+	#puts "ndiffdone, prevhunkend not set"
+    }
+    set diffing 0
+    $textw delete "end - 1c" end
+    $textw conf -state disabled
+
+    # configure the merge button
+    confmergebut
+    confmpatchbut
+}
+
+proc diffmerge {ix dir} {
+    global diffdirs difffile diffmtime fserial linelist
+    global dirs diffcolors textfont incline diffndirs
+    global fcontents allf
+    set infile [joinname $dir $difffile]
+    if {$diffmtime($infile) != [file mtime $infile]} {
+	error_popup "File $infile has changed since the diff was performed."
+	return
+    }
+
+    set di [lsearch -exact $dirs $dir]
+    set fi $fserial($difffile)
+    set w ".merge:$di:$fi"
+    catch {destroy $w}
+    toplevel $w
+    wm title $w "Dirdiff: merged $infile"
+    frame $w.bar -relief raised -border 2
+    pack $w.bar -side top -fill x
+    menubutton $w.bar.file -text File -menu $w.bar.file.m -padx 10 -pady 1
+    menu $w.bar.file.m -tearoff 0
+    $w.bar.file.m add command -label Save -command "savemerge $w"
+    $w.bar.file.m add command -label Close -command "destroy $w"
+    pack $w.bar.file -side left
+    menubutton $w.bar.edit -text Edit -menu $w.bar.edit.m -padx 10 -pady 1
+    menu $w.bar.edit.m -tearoff 0
+    $w.bar.edit.m add command -label Cut -command "tk_textCut $w.t"
+    $w.bar.edit.m add command -label Copy -command "tk_textCopy $w.t"
+    $w.bar.edit.m add command -label Paste -command "tk_textPaste $w.t"
+    $w.bar.edit.m add command -label Find \
+	    -command "difffind :merge:$di:$fi $w.t"
+    pack $w.bar.edit -side left
+    frame $w.f -relief sunk -border 2
+    entry $w.f.filename
+    $w.f.filename insert 0 $infile
+    pack $w.f.filename -side left -fill x -expand 1
+    pack $w.f -side top -fill x
+    text $w.t -yscrollcommand "$w.sb set" -font $textfont
+    scrollbar $w.sb -command "$w.t yview"
+    pack $w.sb -side right -fill y
+    pack $w.t -side left -fill both -expand 1
+    bind $w <Key-Prior> "$w.t yview scroll -1 p"
+    bind $w <Key-Next> "$w.t yview scroll 1 p"
+    for {set x 0} {$x < $diffndirs} {incr x} {
+	$w.t tag conf d$x -back [lindex $diffcolors $x]
+    }
+
+    set inf $fcontents($ix)
+    set l 1
+    foreach m $linelist {
+	set lns [lindex $m 0]
+	set ty [lindex $m 1]
+	if {$lns == {} || $ty == {}} continue
+	set tl [lindex $lns $ix]
+	if {$tl != {}} {
+	    for {} {$l < $tl} {incr l} {
+		set line [lindex $inf [expr $l-1]]
+		$w.t insert end "$line\n"
+	    }
+	}
+	if {$ty == $allf} {
+	    set line [lindex $inf [expr $l-1]]
+	    $w.t insert end "$line\n"
+	    incr l
+	} elseif {[llength $ty] < $diffndirs} {
+	    set isme [expr {$ty == $ix || [lsearch -exact $ty $ix] >= 0}]
+	    set lix [lindex $m 3]
+	    set inc $incline($lix)
+	    if {!$inc} {
+		if {$isme} {
+		    set line [lindex $inf [expr $l-1]]
+		    $w.t insert end "$line\n" d$ix
+		    incr l
+		}
+	    } else {
+		if {!$isme} {
+		    # insert this line
+		    set line [lindex $m 2]
+		    set last [lindex $ty end]
+		    $w.t insert end "$line\n" d$last
+		} else {
+		    # delete this line
+		    incr l
+		}
+	    }
+	}
+    }
+    for {set nl [llength $inf]} {$l <= $nl} {incr l} {
+	set line [lindex $inf [expr $l-1]]
+	$w.t insert end "$line\n"
+    }
+    # delete last newline
+    catch {$w.t delete "end - 1c" end}
+}
+
+proc savemerge {w} {
+    set infile [$w.f.filename get]
+    if {$infile == {}} {return}
+    set tmpfile "$infile.tmp"
+    set tf [open $tmpfile w]
+    puts -nonewline $tf [$w.t get 0.0 end]
+    close $tf
+    scmedit $infile
+    catch {file attr $tmpfile -perm [file attr $infile -perm]}
+    file rename -force $infile $infile.orig
+    file rename $tmpfile $infile
+    destroy $w
+    redifffiles
+}
+
+# Make a patch that would make the same changes to a destination
+# file that doing a merge would have made.
+proc diffmpatch {ix dir} {
+    global difffile diffmtime linelist
+    global dirs textfont incline diffndirs filemode
+    global fcontents allf mpatchserial
+
+    if {![info exists mpatchserial]} {
+	set mpatchserial 0
+    }
+    set fi [incr mpatchserial]
+    set w ".mpatch:$fi"
+    toplevel $w
+    set fname [joinname $dir $difffile]
+    set ftail [file tail $fname]
+    wm title $w "Dirdiff: patch for $ftail"
+    frame $w.bar -relief raised -border 2
+    pack $w.bar -side top -fill x
+    menubutton $w.bar.file -text File -menu $w.bar.file.m -padx 10 -pady 1
+    menu $w.bar.file.m -tearoff 0
+    $w.bar.file.m add command -label Save -command "savemerge $w"
+    $w.bar.file.m add command -label Close -command "destroy $w"
+    pack $w.bar.file -side left
+    menubutton $w.bar.edit -text Edit -menu $w.bar.edit.m -padx 10 -pady 1
+    menu $w.bar.edit.m -tearoff 0
+    $w.bar.edit.m add command -label Cut -command "tk_textCut $w.t"
+    $w.bar.edit.m add command -label Copy -command "tk_textCopy $w.t"
+    $w.bar.edit.m add command -label Paste -command "tk_textPaste $w.t"
+    $w.bar.edit.m add command -label Find \
+	    -command "difffind :mpatch:$fi $w.t"
+    pack $w.bar.edit -side left
+    frame $w.f -relief sunk -border 2
+    entry $w.f.filename
+    $w.f.filename insert 0 "$ftail.patch"
+    pack $w.f.filename -side left -fill x -expand 1
+    pack $w.f -side top -fill x
+    text $w.t -yscrollcommand "$w.sb set" -font $textfont
+    scrollbar $w.sb -command "$w.t yview"
+    pack $w.sb -side right -fill y
+    pack $w.t -side left -fill both -expand 1
+    bind $w <Key-Prior> "$w.t yview scroll -1 p"
+    bind $w <Key-Next> "$w.t yview scroll 1 p"
+
+    set inf $fcontents($ix)
+    set l 1
+    set delta 0
+    set pluslines {}
+    set ctxstart {}
+    set filelen [llength $fcontents($ix)]
+
+    foreach m $linelist {
+	set lns [lindex $m 0]
+	set ty [lindex $m 1]
+	set lix [lindex $m 3]
+	if {$lns == {}} continue
+	set lineno [lindex $lns $ix]
+	if {$lineno != {}} {
+	    set l $lineno
+	}
+	if {$ty == {} || $ty == $allf || $lix == {} \
+		|| ($lineno != {} && !$incline($lix))} {
+	    # output accumulated '+' lines
+	    if {$pluslines != {}} {
+		$w.t insert end $pluslines
+		set pluslines {}
+	    }
+	    if {$ty != {} && $lineno != {}} {
+		incr l
+	    }
+	    continue
+	}
+	if {!$incline($lix)} continue
+
+	# see if we need to start a new hunk
+	if {$ctxstart == {} || $l > $ctxstart + 6} {
+	    if {$ctxstart == {}} {
+		# insert diff header
+		set difftimefmt "%Y-%m-%d %H:%M:%S"
+		$w.t insert end "--- $fname.orig\t"
+		$w.t insert end [clock format $diffmtime($fname) \
+				     -format $difftimefmt]
+		$w.t insert end "\n+++ $fname\t"
+		$w.t insert end [clock format [clock seconds] \
+				     -format $difftimefmt]
+		$w.t insert end "\n"
+	    } else {
+		finishhunk $w $ix $ctxstart $nctx $ndel $nadd
+	    }
+	    set nctx 0
+	    set ndel 0
+	    set nadd 0
+	    set ctxstart [expr $l - 3]
+	    if {$ctxstart < 1} {set ctxstart 1}
+	    $w.t insert end "@@ -$ctxstart, "
+	    $w.t mark set nminus "end - 2c"
+	    $w.t insert end "+[expr $ctxstart + $delta], "
+	    $w.t mark set nplus "end - 2c"
+	    $w.t insert end "\n"
+	}
+	while {$ctxstart < $l} {
+	    set line [lindex $fcontents($ix) [expr $ctxstart - 1]]
+	    $w.t insert end " $line\n"
+	    incr nctx
+	    incr ctxstart
+	}
+
+	if {$lineno != {}} {
+	    # delete this line
+	    set line [lindex $inf [expr $lineno-1]]
+	    $w.t insert end "-$line\n"
+	    incr delta -1
+	    incr l
+	    incr ndel
+	} else {
+	    # insert this line
+	    set line [lindex $m 2]
+	    append pluslines "+$line\n"
+	    incr delta
+	    incr nadd
+	}
+	set ctxstart $l
+    }
+
+    if {$pluslines != {}} {
+	$w.t insert end $pluslines
+    }
+    if {$ctxstart != {}} {
+	finishhunk $w $ix $ctxstart $nctx $ndel $nadd
+    }
+    # delete last newline
+    catch {$w.t delete "end - 1c" end}
+}
+
+proc finishhunk {w ix ctxstart nctx nneg npos} {
+    global fcontents
+
+    set filelen [llength $fcontents($ix)]
+    for {set i $ctxstart} {$i < $ctxstart + 3} {incr i} {
+	if {$i > $filelen} break
+	set line [lindex $fcontents($ix) [expr $i - 1]]
+	$w.t insert end " $line\n"
+	incr nctx
+    }
+    $w.t insert nminus [expr $nctx + $nneg]
+    $w.t insert nplus [expr $nctx + $npos]
+}
+
+proc nextdiff {} {
+    global textw linelist
+    set l [lindex [split [$textw index @0,0] .] 0]
+    set nl [llength $linelist]
+    while {[incr l] < $nl} {
+	if {[lindex [lindex $linelist $l] 1] == {}} {
+	    $textw yview $l.0
+	    break
+	}
+    }
+}
+
+proc prevdiff {} {
+    global textw linelist
+    set l [lindex [split [$textw index @0,0] .] 0]
+    while {[incr l -1] > 0} {
+	if {[lindex [lindex $linelist $l] 1] == {}} {
+	    $textw yview $l.0
+	    break
+	}
+    }
+}
+
+proc diffnextfile {inc} {
+    global diffdirs selfile numgroups groups dirs textw
+    global ycoord canvw origdiffdirs
+    if {!([info exists textw] && [winfo exists $textw])} return
+    if {![selnextline $inc] || $numgroups <= 1 \
+	    || ![info exists origdiffdirs]} {
+	return
+    }
+    set seengrps {}
+    set group [lindex $groups($selfile) 1]
+    set ds {}
+    foreach d $origdiffdirs {
+	set i [lindex $group [lsearch $dirs $d]]
+	if {$i != 0 && [lsearch -exact $seengrps $i] < 0} {
+	    lappend ds $d
+	    lappend seengrps $i
+	}
+    }
+    if {[llength $ds] == 2} {
+	diff2 [lindex $ds 0] [lindex $ds 1] $selfile 0
+    } elseif {[llength $ds] > 2} {
+	diffn $ds $selfile 0
+    }
+}
+
+proc showsomediff {inc} {
+    global diffdirs difffile selfile numgroups groups dirs textw
+    global ycoord canvw groupelts dirinterest
+    if {![selnextline $inc]} return
+    if {[lindex $groups($selfile) 0] == "dir"} return
+
+    if {$numgroups <= 1} {
+	set xi [lindex $groupelts(1) 0]
+	if {$xi != ""} {
+	    showfile [lindex $dirs $xi] $selfile
+	}
+	return
+    }
+
+    set dirlist {}
+    for {set gn 1} {$gn <= $numgroups} {incr gn} {
+	foreach i $groupelts($gn) {
+	    if {$dirinterest($i)} {
+		lappend dirlist [lindex $dirs $i]
+		break
+	    }
+	}
+    }
+    if {[llength $dirlist] == 2} {
+	diff2 [lindex $dirlist 0] [lindex $dirlist 1] $selfile
+    } elseif {[llength $dirlist] > 2} {
+	diffn $dirlist $selfile
+    }
+}
+
+proc copydifffile {} {
+    global diffdirs selfile groups dirs changed
+    if {![info exists diffdirs] || [llength $diffdirs] != 2} return
+    set d1 [lindex $diffdirs 0]
+    set d2 [lindex $diffdirs 1]
+    if {[lindex $groups($selfile) 0] == "dir"} return
+    set group [lindex $groups($selfile) 1]
+    set n1 [lsearch $dirs $d1]
+    set n2 [lsearch $dirs $d2]
+    set i1 [lindex $group $n1]
+    set i2 [lindex $group $n2]
+    if {$i1 == 0 || $i2 == 0 || $i1 == $i2} return
+    set changed 0
+    copyfile $n2 $n1 $selfile 0
+    if {$changed} redisplay
+}
+
+proc maketextw {} {
+    global textw texttop mergebut mpatchbut filemode textfont dirs
+    toplevel .diffs
+    wm title .diffs "Differences"
+    frame .diffs.bar -relief sunken -border 2
+    pack .diffs.bar -side top -fill x
+    button .diffs.bar.rediff -text Rediff -command "diffnextfile 0"
+    pack .diffs.bar.rediff -side left
+    button .diffs.bar.options -text Options -command diffoptions
+    pack .diffs.bar.options -side left
+    button .diffs.bar.find -text Find -command "difffind :diffs .diffs.t"
+    pack .diffs.bar.find -side left
+    menubutton .diffs.bar.merge -text Merge -menu .diffs.bar.merge.m -padx 10
+    menu .diffs.bar.merge.m -tearoff 0
+    pack .diffs.bar.merge -side left
+    menubutton .diffs.bar.mpatch -text Patch -menu .diffs.bar.mpatch.m -padx 10
+    menu .diffs.bar.mpatch.m -tearoff 0
+    pack .diffs.bar.mpatch -side left
+    if {!$filemode} {
+	button .diffs.bar.next -text "Next file" -command "diffnextfile 1"
+	pack .diffs.bar.next -side left
+	button .diffs.bar.prev -text "Previous file" -command "diffnextfile -1"
+	pack .diffs.bar.prev -side left
+    }
+    button .diffs.bar.invert -text "Invert" -command "invertbuttons"
+    pack .diffs.bar.invert -side left
+    set texttop .diffs
+    set textw .diffs.t
+    set mergebut .diffs.bar.merge
+    set mpatchbut .diffs.bar.mpatch
+    set wid [expr 82 + 2 * [llength $dirs]]
+    text $textw -width $wid -height 32 -yscrollcommand ".diffs.sb set" \
+	-font $textfont
+    scrollbar .diffs.sb -command "$textw yview"
+    pack .diffs.sb -side right -fill y
+    pack $textw -side left -fill both -expand 1
+    bind .diffs <Key-Prior> "$textw yview scroll -1 p"
+    bind .diffs b "$textw yview scroll -1 p"
+    bind .diffs B "$textw yview scroll -1 p"
+    bind .diffs <Key-BackSpace> "$textw yview scroll -1 p"
+    bind .diffs <Key-Delete> "$textw yview scroll -1 p"
+    bind .diffs <Key-Next> "$textw yview scroll 1 p"
+    bind .diffs <Key-space> "$textw yview scroll 1 p"
+    bind .diffs <Key-Up> "$textw yview scroll -1 u"
+    bind .diffs <Key-Down> "$textw yview scroll 1 u"
+    bind .diffs d "$textw yview scroll \[expr \"int(\[$textw cget -height\]/2)\"\] u"
+    bind .diffs D "$textw yview scroll \[expr \"int(\[$textw cget -height\]/2)\"\] u"
+    bind .diffs u "$textw yview scroll \[expr \"int(-\[$textw cget -height\]/2)\"\] u"
+    bind .diffs U "$textw yview scroll \[expr \"int(-\[$textw cget -height\]/2)\"\] u"
+    bind .diffs n nextdiff
+    bind .diffs p prevdiff
+    if {!$filemode} {
+	bind .diffs N "diffnextfile 1"
+	bind .diffs P "diffnextfile -1"
+    }
+    bind .diffs q removediffs
+    bind .diffs Q "set stopped 1; destroy ."
+    bind .diffs <Key-Home> "$textw yview 1.0"
+    bind .diffs g "$textw yview 1.0"
+    bind .diffs <Key-End> "$textw yview -pickplace \[$textw index end\]"
+    bind .diffs G "$textw yview -pickplace \[$textw index end\]"
+    bind .diffs C copydifffile
+}
+
+proc diffoptions {} {
+    global optionw
+    if {[info exists optionw] && [winfo exists $optionw]} {
+	raise $optionw
+	return
+    }
+    set optionw .options
+    toplevel $optionw
+    wm title .options "Dirdiff options"
+    checkbutton $optionw.diffiflag -text "Ignore case" \
+	    -offvalue "" -onvalue "-i" -anchor w
+    pack $optionw.diffiflag -side top -fill x
+    checkbutton $optionw.diffwflag -text "Ignore all white space" \
+	    -offvalue "" -onvalue "-w" -anchor w
+    pack $optionw.diffwflag -side top -fill x
+    checkbutton $optionw.diffbflag -text "Ignore amount of white space" \
+	    -offvalue "" -onvalue "-b" -anchor w
+    pack $optionw.diffbflag -side top -fill x
+    checkbutton $optionw.diffBflag -text "Ignore blank lines" \
+	    -offvalue "" -onvalue "-B" -anchor w
+    pack $optionw.diffBflag -side top -fill x
+    checkbutton $optionw.diffdflag -text "Minimize diffs" \
+	    -offvalue "" -onvalue "-d" -anchor w
+    pack $optionw.diffdflag -side top -fill x
+    checkbutton $optionw.ultabs -text "Underline tabs" -anchor w \
+	    -variable underlinetabs -command changeunderlinetabs
+    pack $optionw.ultabs -side top -fill x
+    checkbutton $optionw.newfirst -text "Newer file first" -anchor w \
+	    -variable diffnewfirst
+    pack $optionw.newfirst -side top -fill x
+    frame $optionw.ctx
+    pack $optionw.ctx -side top
+    label $optionw.ctx.l -text "Lines of context: "
+    pack $optionw.ctx.l -side left
+    entry $optionw.ctx.v -width 5 -textvariable ctxlines
+    pack $optionw.ctx.v -side left
+    button $optionw.save -text "Save options" -command saveoptions
+    pack $optionw.save -side top -fill x
+    frame $optionw.space -height 6
+    pack $optionw.space -side top -fill x
+    button $optionw.dismiss -text "Dismiss" -command "destroy $optionw"
+    pack $optionw.dismiss -side bottom -fill x
+    bind $optionw <Return> "destroy $optionw"
+}
+
+proc saveoptions {} {
+    global rcsflag diffiflag diffwflag diffbflag diffBflag diffdflag
+    global ctxlines showsame underlinetabs nukefiles redisp_immed
+    global diffprogram showprogram
+    global diffnewfirst textfont filelistfont nxdirmode
+    global docvsignore
+    set f [open "~/.dirdiff" w]
+    puts $f [list set diffprogram $diffprogram]
+    puts $f [list set showprogram $showprogram]
+    puts $f [list set rcsflag $rcsflag]
+    puts $f [list set diffiflag $diffiflag]
+    puts $f [list set diffwflag $diffwflag]
+    puts $f [list set diffbflag $diffbflag]
+    puts $f [list set diffBflag $diffBflag]
+    puts $f [list set diffdflag $diffdflag]
+    puts $f [list set ctxlines $ctxlines]
+    puts $f [list set showsame $showsame]
+    puts $f [list set underlinetabs $underlinetabs]
+    puts $f [list set redisp_immed $redisp_immed]
+    puts $f [list set diffnewfirst $diffnewfirst]
+    puts $f [list set nukefiles $nukefiles]
+    puts $f [list set filelistfont $filelistfont]
+    puts $f [list set textfont $textfont]
+    puts $f [list set nxdirmode $nxdirmode]
+    puts $f [list set docvsignore $docvsignore]
+    close $f
+}
+
+proc difffind {tag txt} {
+    global dfindw$tag igncase$tag diffiflag regexp$tag backwards$tag
+    if {[info exists dfindw$tag] && [winfo exists [set dfindw$tag]]} {
+	raise [set dfindw$tag]
+	return
+    }
+    set w .find$tag
+    set dfindw$tag $w
+    toplevel $w
+    wm title $w "Dirdiff: Find"
+    frame $w.f
+    pack $w.f -side top -fill x -expand 1
+    button $w.f.b -text "Find:" -command [list dofind $tag $txt $w]
+    bind $w <Return> [list dofind $tag $txt $w]
+    pack $w.f.b -side left
+    entry $w.f.e
+    pack $w.f.e -side right
+    if {![info exists igncase$tag]} {
+	set igncase$tag [expr {$diffiflag != {}}]
+    }
+    checkbutton $w.case -variable igncase$tag -text "Ignore case" -anchor w
+    pack $w.case -side top -fill x
+    checkbutton $w.regexp -variable regexp$tag -text "Regular expression" \
+	    -anchor w
+    pack $w.regexp -side top -fill x
+    checkbutton $w.backwards -variable backwards$tag \
+	    -text "Search backwards" -anchor w
+    pack $w.backwards -side top -fill x
+    button $w.close -text "Close" -command "destroy $w"
+    pack $w.close -side top -fill x
+}
+
+proc dofind {tag txt w} {
+    global dfindw$tag igncase$tag regexp$tag backwards$tag
+    if {![winfo exists $txt]} return
+    set w [set dfindw$tag]
+    set str [$w.f.e get]
+    if {$str == {}} return
+    set back [set backwards$tag]
+    # By default, start the search from the insertion point.
+    # If there is a selection, start from the end of the selection for
+    # a forwards search, or from the beginning for a backwards search.
+    set start [$txt index insert]
+    if {[$txt tag ranges sel] != {}} {
+	if {$back} {
+	    set start [$txt index sel.first]
+	} else {
+	    set start [$txt index sel.last]
+	}
+    }
+    set opts {}
+    if {$back} {
+	lappend opts "-backwards"
+    }
+    if {[set regexp$tag]} {
+	lappend opts "-regexp"
+    }
+    if {[set igncase$tag]} {
+	lappend opts "-nocase"
+    }
+    set pos [eval $txt search $opts -count count -- [list $str] $start]
+    if {$pos == {}} {
+	bell
+	return
+    }
+    set epos "$pos + $count c"
+    $txt mark set insert $epos
+    $txt tag remove sel 0.0 end
+    $txt tag add sel $pos $epos
+    $txt see $epos
+    $txt see $pos
+}
+
+proc makepatch {d1 d2} {
+    global patchnum selfile patchfiles patch_outfile
+    global showprogram
+
+    set files [secondarysel $selfile]
+    if {$files == {}} {
+	error_popup "No files selected!"
+	return
+    }
+    if {![info exists patchnum]} {
+	set patchnum 0
+    }
+    set patchfiles($patchnum) $files
+
+    # Put the diff in a temporary file for external viewer
+    if { [llength $showprogram] > 0} {
+       set patch_outfile "patch${patchnum}.diff"
+       set w [open $patch_outfile w]
+    # Or build our own viewer
+    } else {
+       set w ".patch:$patchnum"
+       catch {destroy $w}
+       toplevel $w
+       wm title $w "Patch: $d1 to $d2"
+       frame $w.bar -relief raised -border 2
+       pack $w.bar -side top -fill x
+       menubutton $w.bar.file -text File -menu $w.bar.file.m -padx 10 -pady 1
+       menu $w.bar.file.m -tearoff 0
+       $w.bar.file.m add command -label Save -command "savepatch $w"
+       $w.bar.file.m add command -label Close -command "destroy $w"
+       pack $w.bar.file -side left
+       menubutton $w.bar.edit -text Edit -menu $w.bar.edit.m -padx 10 -pady 1
+       menu $w.bar.edit.m -tearoff 0
+       $w.bar.edit.m add command -label Cut -command "tk_textCut $w.t"
+       $w.bar.edit.m add command -label Copy -command "tk_textCopy $w.t"
+       $w.bar.edit.m add command -label Paste -command "tk_textPaste $w.t"
+       $w.bar.edit.m add command -label Find \
+	    -command "difffind :patch:$patchnum $w.t"
+       pack $w.bar.edit -side left
+       frame $w.f -relief sunk -border 2
+       label $w.f.l -text "Filename: "
+       entry $w.f.filename
+       $w.f.filename insert 0 "patch$patchnum"
+       pack $w.f.l -side left
+       pack $w.f.filename -side left -fill x -expand 1
+       pack $w.f -side top -fill x
+       text $w.t -yscrollcommand "$w.sb set"
+       scrollbar $w.sb -command "$w.t yview"
+       pack $w.sb -side right -fill y
+       pack $w.t -side left -fill both -expand 1
+       bind $w <Key-Prior> "$w.t yview scroll -1 p"
+       bind $w <Key-Next> "$w.t yview scroll 1 p"
+    }
+
+    patchnext $patchnum $w $d1 $d2 0
+    incr patchnum
+}
+
+# Output lines to either our external patchfile or the internal vieiwer
+proc lineout {w line} {
+    if {[string match ".*" $w]} {
+        $w.t insert end "$line\n"
+    } else {
+        puts $w "$line"
+    }
+}
+
+proc patchnext {pnum w d1 d2 i} {
+    global patchfiles have_unidiff showprogram patch_outfile nullfile
+
+    set contextopt [expr {$have_unidiff ? "-u" : "-c"}]
+    update
+    for {} {[set f [lindex $patchfiles($pnum) $i]] != {}} {incr i} {
+	set p1 [joinname $d1 $f]
+	set p2 [joinname $d2 $f]
+	if {[file exists $p1] && [file exists $p2]} {
+	    set fh [open "|diff $contextopt $p1 $p2" r]
+	} elseif {[file exists $p1] && ! [file exists $p2]} {
+	    set fh [open "|diff $contextopt $p1 $nullfile" r]
+	} elseif {! [file exists $p1] && [file exists $p2]} {
+	    set fh [open "|diff $contextopt $nullfile $p2" r]
+	} else {
+            continue
+	}
+	fconfigure $fh -blocking 0
+	fileevent $fh readable "readpatch $fh $pnum $w $d1 $d2 $i \"$f\""
+	return
+    }
+    if {[string match ".*" $w]} {
+       $w.t delete "end - 1c" end
+    } else {
+        close $w
+        eval "exec $showprogram \"$patch_outfile\" &"
+        # Should we remove the tempfile here?  We don't have it if we used 
+        # the internal viewer
+    }
+    unset patchfiles($pnum)
+}
+
+proc diffl_out {w d1 d2 f} {
+    global have_unidiff
+    set contextopt [expr {$have_unidiff ? "-urN" : "-cr"}]
+    lineout $w "diff $contextopt [joinname $d1 $f] [joinname $d2 $f]"
+}
+
+proc readpatch {difff pnum w d1 d2 i f} {
+    global have_unidiff showprogram
+    set n [gets $difff line]
+    if {$n < 0} {
+	if {![eof $difff]} return
+	catch {close $difff}
+	patchnext $pnum $w $d1 $d2 [expr $i+1]
+	return
+    }
+    if {[string match "Binary*" $line]} return
+    if {$have_unidiff} {
+       if {[string match "---*" $line]} {
+           diffl_out $w $d1 $d2 $f
+        }
+    } else {
+       if {[string match "\*\*\* ${d1}*" $line]} {
+           diffl_out $w $d1 $d2 $f
+        }
+    }
+    lineout $w $line
+}
+
+proc savepatch {w} {
+    set outfile [$w.f.filename get]
+    if {$outfile == {}} {return}
+    set outf [open $outfile w]
+    puts -nonewline $outf [$w.t get 0.0 end]
+    close $outf
+    destroy $w
+}
+
+# invoked from the File->Touch menu item
+proc touchfiles {d} {
+    global selfile
+    set files [secondarysel $selfile]
+    if {$files == {}} {
+	error_popup "No files selected!"
+	return
+    }
+    set now [clock seconds]
+    set bad {}
+    foreach f $files {
+	set df [file join $d $f]
+	if {[catch {file mtime $df $now} err]} {
+	    append bad "$df: $err\n"
+	}
+    }
+    if {$bad != {}} {
+	error_popup "Errors occurred:\n$bad"
+    }
+    redifffiles
+}
+
+proc exclfilelist {} {
+    global exclw nukefiles
+    if {[info exists exclw] && [winfo exists $exclw]} {
+	raise $exclw
+	return
+    }
+    toplevel .excl
+    wm title .excl "Dirdiff: excluded files"
+    set exclw .excl
+    frame $exclw.b
+    listbox $exclw.l -height 10 -width 40 -yscrollcommand "$exclw.sb set" \
+	    -selectmode single
+    scrollbar $exclw.sb -command "$exclw.l yview"
+    entry $exclw.e
+    pack $exclw.b -side bottom -fill x
+    pack $exclw.e -side bottom -fill x
+    pack $exclw.sb -side right -fill y
+    pack $exclw.l -side left -fill both -expand 1
+    button $exclw.b.add -text "Add" -padx 20 -command addexcl
+    button $exclw.b.rem -text "Remove" -command remexcl
+    button $exclw.b.close -text "Close" -command closeexcl
+    pack $exclw.b.add -side left -fill x
+    pack $exclw.b.rem -side left -fill x
+    pack $exclw.b.close -side right -fill x
+    bind $exclw.e <Return> "addexcl"
+    foreach i $nukefiles {
+	$exclw.l insert end $i
+    }
+}
+
+proc addexcl {} {
+    global exclw nukefiles
+    if {[info exists exclw] && [winfo exists $exclw]} {
+	set e [$exclw.e get]
+	if {$e != {}} {
+	    $exclw.l insert end $e
+	    lappend nukefiles $e
+	    $exclw.l see end
+	}
+    }
+}
+
+proc remexcl {} {
+    global exclw nukefiles
+    if {[info exists exclw] && [winfo exists $exclw]} {
+	set s [$exclw.l curselection]
+	if {$s != {}} {
+	    $exclw.l delete $s
+	    set nukefiles [lreplace $nukefiles $s $s]
+	}
+    }
+}
+
+proc exclsel {} {
+    global selfile nukefiles exclw
+    set files [secondarysel $selfile]
+    foreach f $files {
+	set df [string trimright $f /]
+	if {$df != {}} {
+	    lappend nukefiles $df
+	    if {[info exists exclw] && [winfo exists $exclw]} {
+		$exclw.l insert end $df
+	    }
+	}
+    }
+    redisplay
+}
+
+proc extprograms {} {
+   global showprogram diffprogram
+   toplevel .ext
+   frame .ext.top
+   label .ext.top.diffl -text "Diff Viewing/Merging"
+   entry .ext.top.diffe -textvariable diffprogram
+   label .ext.top.showl -text "File Viewing"
+   entry .ext.top.showe -textvariable showprogram
+   grid .ext.top.diffl -row 0 -column 0 -sticky e
+   grid .ext.top.diffe -row 0 -column 1 -sticky nsew -pady 4
+   grid .ext.top.showl -row 1 -column 0 -sticky e
+   grid .ext.top.showe -row 1 -column 1 -sticky nsew -pady 4
+   grid columnconfigure .ext.top 0 -weight 0
+   grid columnconfigure .ext.top 1 -weight 1
+   pack .ext.top -fill x -expand yes
+   frame .ext.bot
+   button .ext.bot.ok -text "OK" \
+     -command {
+        destroy .ext
+     }
+  pack .ext.bot .ext.bot.ok -fill x -expand yes
+}
+
+proc closeexcl {} {
+    global exclw
+    catch {destroy $exclw}
+    catch {unset exclw}
+}
+
+proc secondarysel {fname} {
+    global secsel canvw
+    set files {}
+    foreach it [array names secsel] {
+	lappend files [$canvw itemcget $it -text]
+    }
+    if {$files == {}} {
+	if {$fname == {}} {
+	    return {}
+	}
+	set files [list $fname]
+    }
+    return [lsort $files]
+}
+
+proc copyselfile {src dst fname confirm} {
+    global dirs changed
+    set files [secondarysel $fname]
+    set n [llength $files]
+    set changed 0
+    if {$n == 1} {
+	copyfile $src $dst $fname $confirm
+    } else {
+	if {$confirm} {
+	    set sd [lindex $dirs $src]
+	    set dd [lindex $dirs $dst]
+	    if {![confirm_popup "Copy $n older files from $sd to $dd?"]} {
+		return
+	    }
+	}
+	foreach f $files {
+	    copyfile $src $dst $f 0
+	}
+    }
+    if {$changed} redisplay
+    after idle selcurfile
+}
+
+proc copyfile {src dst fname confirm} {
+    global dirs filemode
+    set sd [lindex $dirs $src]
+    set dd [lindex $dirs $dst]
+    set srcf [joinname $sd $fname]
+    set dstf [joinname $dd $fname]
+    if {$filemode} {
+	set msg "$src to $dst"
+	set copydst $dstf
+    } else {
+	set msg "$fname from $sd to $dd"
+	set copydst [file dirname $dstf]
+    }
+    if {$confirm} {
+	if {![confirm_popup "Copy older $msg?"]} {
+	    return
+	}
+    }
+    set z [string trimright $fname /]
+    if {$z != $fname} {
+	copydir $src $dst $z
+	return
+    }
+    scmedit $dstf
+    if [catch {file copy -force -- $srcf $copydst} err] {
+	error_popup "Error copying $msg: $err"
+    } else {
+	scmnew $dstf
+	updatecline $src $dst $fname
+    }
+}
+
+proc copydir {src dst dname} {
+    global dirs groups alllines
+    set sn [lindex $dirs $src]
+    set dn [lindex $dirs $dst]
+    if [catch {exec cp -p -r $sn/$dname [file dirname $dn/$dname]} err] {
+	error_popup "Error copying $dname from $sn to $dn: $err"
+	return
+    }
+    foreach f $alllines {
+	if [string match $dname* $f] {
+	    updatecline $src $dst $f
+	}
+    }
+}
+
+proc scmedit {name} {
+}
+
+proc scmnew {name} {
+}
+
+proc removeselfile {dst fname} {
+    global groupelts dirs changed
+    set files [secondarysel $fname]
+    if {$files == {}} return
+    set nf 0
+    set nd 0
+    foreach x $files {
+	if {[string range $x end end] == "/"} {
+	    incr nd
+	} else {
+	    incr nf
+	}
+    }
+    set dd [lindex $dirs $dst]
+    if {$nd + $nf == 1} {
+	set x [string trimright [joinname $dd $fname] /]
+	if {![confirm_popup "Remove $x?"]} {
+	    return
+	}
+    } else {
+	set stuff "Remove "
+	if {$nd > 0} {
+	    if {$nd == 1} {
+		append stuff "1 directory "
+	    } else {
+		append stuff "$nd directories "
+	    }
+	    if {$nf > 0} {
+		append stuff "and "
+	    }
+	}
+	if {$nf == 1} {
+	    append stuff "1 file "
+	} elseif {$nf > 1} {
+	    append stuff "$nf files "
+	}
+	append stuff "from $dd?"
+	if {![confirm_popup $stuff]} {
+	    return
+	}
+    }
+    set changed 0
+    foreach f $files {
+	set d [string trimright $f /]
+	set dstf [joinname $dd $d]
+	if {$d == $f} {
+	    set bad [catch {file delete $dstf} err]
+	} else {
+	    set bad [catch {file delete -force $dstf} err]
+	}
+	if $bad {
+	    error_popup "Error deleting $dstf: $err"
+	} else {
+	    updatecline [lindex $groupelts(0) 0] $dst $f
+	}
+    }
+    if {$changed} redisplay
+    after idle selcurfile
+}
+
+proc confirm_popup msg {
+    global confirm_ok
+    set confirm_ok 0
+    set w .confirm
+    toplevel $w
+    wm transient $w .
+    message $w.m -text $msg -justify center -aspect 400
+    pack $w.m -side top -fill x -padx 20 -pady 20
+    button $w.ok -text OK -command "set confirm_ok 1; destroy $w"
+    pack $w.ok -side left -fill x
+    button $w.cancel -text Cancel -command "destroy $w"
+    pack $w.cancel -side right -fill x
+    bind $w <Visibility> "grab $w; focus $w"
+    tkwait window $w
+    return $confirm_ok
+}
+
+proc error_popup msg {
+    set w .error
+    toplevel $w
+    wm transient $w .
+    message $w.m -text $msg -justify center -aspect 400
+    pack $w.m -side top -fill x -padx 20 -pady 20
+    button $w.ok -text OK -command "destroy $w"
+    pack $w.ok -side bottom -fill x
+    bind $w <Visibility> "grab $w; focus $w"
+    tkwait window $w
+}
+
+proc notalldirs {dirs} {
+    set type ""
+    foreach d $dirs {
+	if {[catch {file lstat $d stat} err]} {
+	    puts stderr $err
+	    exit 1
+	}
+	if {$type == ""} {
+	    set type $stat(type)
+	} elseif {$type != $stat(type)} {
+	    puts stderr "Error: $d is a $stat(type) but [lindex $dirs 0] is a $type"
+	    exit 1
+	}
+    }
+    return [expr {$type == "file"}]
+}
+
+proc go {} {
+    global diffing filemode dirs nextserial
+    if {[llength $dirs] == 0} {exit 0}
+    set diffing 0
+    set nextserial 0
+    set filemode [notalldirs $dirs]
+    icons
+    makewins
+    initcanv
+    resetsel
+    removediffs
+    update
+    canvdiffs
+}
+
+proc rediff {} {
+    initcanv
+    resetsel
+    removediffs
+    update
+    canvdiffs
+}
+
+proc repackgroups {gr} {
+    if {[lindex $gr 0] == "dir"} {
+	return $gr
+    }
+    set glist [lindex $gr 1]
+    set glsort [lsort $glist]
+    set ng(0) 0
+    set lg 0
+    set gc 0
+    foreach e $glsort {
+	if {$e != $lg} {
+	    set lg $e
+	    incr gc
+	    set ng($e) $gc
+	}
+    }
+    if {$gc == [lindex $gr 0]} {
+	return $gr
+    }
+    set newlist {}
+    foreach e $glist {
+	lappend newlist $ng($e)
+    }
+    return [list $gc $newlist]
+}
+
+proc interesting_line {gr} {
+    global dirinterest dirs showsame
+    if {$gr == {}} {
+	return 0
+    }
+    if {$showsame} {
+	return 1
+    }
+    set glist [lindex $gr 1]
+    set i 0
+    foreach e $glist {
+	if $dirinterest($i) {
+	    if {[info exists first]} {
+		if {$e != $first} {
+		    return 1
+		}
+	    } else {
+		set first $e
+	    }
+	}
+	incr i
+    }
+    return 0
+}
+
+proc redisplay {{zapdiffs 0}} {
+    global canvw canvy canvy0 alllines groups ruletype linespc stringx
+    global ruletype selfile secsel ycoord filemode redisp_immed
+    if {$filemode || !($zapdiffs || $redisp_immed)} return
+    set y [expr {[lindex [$canvw yview] 0] * $canvy}]
+    set i [textitemat [expr {$stringx+5}] [expr {$y + $linespc/2}]]
+    set topy 0
+    set topline {}
+    if {$i != {}} {
+	set topline [$canvw itemcget $i -text]
+    }
+    if {$zapdiffs} {
+	removediffs
+    } else {
+	set filesel $selfile
+	set filesecsel [secondarysel $selfile]
+    }
+    $canvw delete all
+    set canvy $canvy0
+    $canvw conf -scrollregion "0 0 0 1"
+    catch {unset ycoord}
+    resetsel
+    foreach f $alllines {
+	if {$f == $topline} {
+	    set topy $canvy
+	}
+	set gr $groups($f)
+	if {$gr != {} && [notnuked [string trimright $f /]]} {
+	    set gr [repackgroups $gr]
+	    set groups($f) $gr
+	    if {[interesting_line $gr]} {
+		displine $gr $f
+	    }
+	}
+    }
+    if {[info exists ruletype]} {
+	ruleoff $ruletype
+    }
+    if {$canvy > 0} {
+	$canvw yview moveto [expr {$topy * 1.0 / $canvy}]
+    } else {
+	$canvw yview moveto 0
+    }
+    if {!$zapdiffs} {
+	foreach f $filesecsel {
+	    set i [itemofname $f]
+	    if {$i != {}} {
+		addsecsel $i
+	    }
+	}
+	set i [itemofname $filesel]
+	if {$i != {}} {
+	    selectitem $i
+	    addsecsel $i
+	}
+	selcurfile
+    }
+}
+
+proc icons {} {
+   global agecolors
+
+   image create photo ex \
+       -format gif -data {
+R0lGODlhEAANAIAAAAAAAP///yH+Dk1hZGUgd2l0aCBHSU1QACH5BAEAAAEA
+LAAAAAAQAA0AAAIgjI95ABqcWENSVXMtzE5CR30g5o3PJkYiR05LenauqRQA
+Ow==
+}
+   image create photo folder \
+       -format gif -data {
+R0lGODlhEAANAMIAAISEhMbGxv/si////wAAAAAAAAAAAAAAACH+Dk1hZGUg
+d2l0aCBHSU1QACH5BAEAAAQALAAAAAAQAA0AAAMoSATM+nAFQUUAUYFZ6W3g
+II4kyQxd2p1qy7bpC1fyLNQzDusu6P+ABAA7
+}
+   image create photo paper \
+       -format gif -data {
+R0lGODlhEAANAKEAAISEhP///8bGxgAAACH+Dk1hZGUgd2l0aCBHSU1QACH5
+BAEAAAMALAAAAAAQAA0AAAIp3ICpxhcPAxCgufhAoE1jmXRfVDHeKIloaq6s
+cY4l7M4XasdfrvSIUQAAOw==
+}
+   image create photo paper_green \
+       -format gif -data {
+R0lGODlhEAANAMIAAP///4SEhP7/vsbGxgDKAP///////////yH5BAEAAAcALAAAAAAQAA0A
+AAMoeBfcrnCRSUmwUdZ5Mezb821hBJKecpKBiVLt+KbaG6szvZaf4zOKBAA7
+}
+   image create photo paper_yellowgreen \
+       -format gif -data {
+R0lGODlhEAANAMIAAP///4SEhP7/vsbGxgCAAACAQNLmAP///yH5BAEAAAcALAAAAAAQAA0A
+AAMoeBfcrnCZSU2wUdZ5Mezb821hBJKecpKBiVLt+KbaG6szvZaf4zOKBAA7
+}
+   image create photo paper_yellow \
+       -format gif -data {
+R0lGODlhEAANAMIAAP///4SEhPfhAMbGxv///////////////yH5BAEAAAMALAAAAAAQAA0A
+AAMoOBPcrnCJSUWwUdZ5Mezb821hBJKecpKBiVLt+KbaG6szvZaf4zOKBAA7
+}
+   image create photo paper_orange \
+       -format gif -data {
+R0lGODlhEAANAMIAAP///4SEhOxzAMbGxv///////////////yH5BAEAAAMALAAAAAAQAA0A
+AAMoOBPcrnCJSUWwUdZ5Mezb821hBJKecpKBiVLt+KbaG6szvZaf4zOKBAA7
+}
+   image create photo paper_red \
+       -format gif -data {
+R0lGODlhEAANAKEAAISEhOE+IbchAP///yH5BAEAAAMALAAAAAAQAA0AAAIo3ICpxhcPA5DN
+xQcEZfPK1HQeFo4QUJqbIY4op66W+bJxPbuhwiNGAQA7
+}
+
+
+   set agecolors(dir) {ex folder}
+   set agecolors(0) {ex}
+   set agecolors(1) {ex paper}
+   set agecolors(2) {ex paper_green paper_red}
+   set agecolors(3) {ex paper_green paper_yellow paper_red}
+   set agecolors(4) {ex paper_green paper_yellow paper_orange paper_red}
+   set agecolors(5) {ex paper_green paper_yellowgreen paper_yellow paper_orange paper_red}
+}
+
+proc midy {bbox} {
+    return [expr ([lindex $bbox 1] + [lindex $bbox 3]) / 2]
+}
+
+proc search_canvas {} {
+    global canvw selfile clickitem clickmode clicky
+    set search $selfile
+    resetsel
+    update
+    set str_items [$canvw find withtag strings]
+    foreach idx $str_items {
+	set name [$canvw itemcget $idx -text]
+	if {[string match "*$search*" $name]} {
+	    set selitem $idx
+	    $canvw select from $idx 0
+	    $canvw select to $idx end
+	    set clickitem $idx
+	    set clicky [midy [$canvw bbox $clickitem]]
+	    set clickmode 1
+	    selcurfile
+	    addsecsel $idx
+	}
+    }
+}
+
+if {![info exists dirs]} {
+    global onlyfiles ctxlines showsame
+    set dirs {}
+    set ok 1
+    set argc [llength $argv]
+    set moreopts 1
+    for {set i 0} {$i < $argc} {incr i} {
+	set arg [lindex $argv $i]
+	if {$moreopts && [string range $arg 0 0] == "-"} {
+	    switch -regexp -- $arg {
+		"--" {
+		    set moreopts 0
+		}
+		"-a|--all" {
+		    set nukefiles {}
+		}
+		"-o|--only" {
+		    incr i
+		    if {$i < $argc} {
+			lappend onlyfiles [lindex $argv $i]
+			set nukefiles {}
+		    } else {
+			puts stderr "no argument given to $arg option"
+			set ok 0
+		    }
+		}
+		"-I|--ignore" {
+		    incr i
+		    if {$i < $argc} {
+			ignorefile [lindex $argv $i]
+		    } else {
+			puts stderr "no argument given to $arg option"
+			set ok 0
+		    }
+		}
+		"-r|--rcs" {
+		    if $nofilecmp {
+			puts stderr "can't use $arg: libfilecmp.so.0.0 couldn't be loaded"
+			set ok 0
+		    }
+		    set rcsflag "-rcs"
+		}
+		"-c|--context" {
+		    incr i
+		    if {$i < $argc} {
+			set ctxlines [lindex $argv $i]
+		    } else {
+			puts stderr "no argument given to $arg option"
+			set ok 0
+		    }
+		}
+		"-D|--maxdepth" {
+		    incr i
+		    if {$i < $argc} {
+			set maxdepth [lindex $argv $i]
+		    } else {
+			puts stderr "no argument given to $arg option"
+			set ok 0
+		    }
+		}
+		"-b" { set diffbflag "-b" }
+		"-w" { set diffwflag "-w" }
+		"-B" { set diffBflag "-B" }
+		"-i" { set diffiflag "-i" }
+		"-d" { set diffdflag "-d" }
+		"-S" { set showsame 1 }
+		"-C" { set docvsignore 1 }
+		"-h|--help" {
+		    usage
+		    exit 0
+		}
+		default {
+		    puts stderr "unrecognized option $arg"
+		    set ok 0
+		}
+	    }
+	} elseif {$arg != {}} {
+	    lappend dirs $arg
+	}
+    }
+    if {$ok && [llength $dirs] == 0} {
+        # Ask for directories if they weren't on the command line
+        wm withdraw .
+        NewDirDialog
+        #set dirs [list $d0 $d1 $d2 $d3 $d4]
+        # Prune out the empty entries
+        set newlist {}
+        for {set i 0} {$i < [llength $dirs]} {incr i} {
+           if {[lindex $dirs $i] != {} } {
+               lappend newlist [lindex $dirs $i]
+           }
+        }
+        set dirs $newlist
+        if {[llength $dirs] < 2 } {
+            # Can't user error_popup here without de-iconifying . first
+            tk_dialog .err "Error" "Need at least 2 directories" error 0 {OK}
+	    set ok 0
+        }
+        wm deiconify .
+    }
+    if {!$ok} {exit 1}
+    set newd {}
+    foreach d $dirs {
+	set x [glob -nocomplain $d]
+	if {$x == {}} {
+	    set x $d
+	}
+	set newd [concat $newd $x]
+    }
+    if {[llength $newd] > 5} {
+	puts stderr "Error: more than 5 directories or files specified"
+	exit 1
+    }
+    set dirs $newd
+    set doit 1
+}
+
+if [info exists doit] {go}
+
