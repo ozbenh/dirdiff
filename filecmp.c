@@ -250,6 +250,7 @@ FileCmpCmd(clientData, interp, argc, argv)
     int k1, k2, t1, t2;
     int rcsflag, bkflag;
     int e1, e2;
+    char res_str[16];
 
     fi = 1;
     rcsflag = 0;
@@ -341,7 +342,9 @@ FileCmpCmd(clientData, interp, argc, argv)
     if (n1 < 0 || n2 < 0)
 	return TCL_ERROR;
 
-    sprintf(interp->result, "%d", same);
+    res_str[15] = 0;
+    snprintf(res_str, 15, "%d", same);
+    Tcl_SetResult(interp, res_str, TCL_VOLATILE);
     return TCL_OK;
 }
 
