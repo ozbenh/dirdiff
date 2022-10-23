@@ -12,7 +12,7 @@ CFLAGS=-O3 -I/usr/include/tcl8.3/ -I/usr/include/tcl
 all:	libfilecmp.so.0.0
 
 libfilecmp.so.0.0: filecmp.c
-	$(CC) $(CFLAGS) -shared -o $@ filecmp.c
+	$(CC) $(CFLAGS) -shared -fPIC -o $@ filecmp.c $(LIBS)
 
 install: dirdiff libfilecmp.so.0.0
 	$(INSTALL) -c dirdiff $(BINDIR)
