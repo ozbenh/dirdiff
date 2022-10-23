@@ -10,6 +10,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <tcl.h>
+#include <unistd.h>
 #include <sys/fcntl.h>
 
 #define BSIZE		32768
