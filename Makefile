@@ -8,17 +8,17 @@ INSTALL=install
 
 # You may need to change the -I arguments depending on your system
 CFLAGS=-O3 $(pkg-config --cflags tcl)
-
 LIBS = $(pkg-config --libs tcl)
+SONAME = libfilecmp.so.0.0
 
-all:	libfilecmp.so.0.0
+all:	$(SONAME)
 
-libfilecmp.so.0.0: filecmp.c
-	$(CC) $(CFLAGS) -shared -fPIC -o $@ filecmp.c $(LIBS)
+$(SONAME): filecmp.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -shared -Wl,-soname=$(SONAME) -fPIC -o $@ filecmp.c $(LIBS)
 
-install: dirdiff libfilecmp.so.0.0
+install: dirdiff $(SONAME)
 	$(INSTALL) -c dirdiff $(BINDIR)
-	$(INSTALL) -c libfilecmp.so.0.0 $(LIBDIR)
+	$(INSTALL) -c $(SONAME) $(LIBDIR)
 
 clean:
-	rm -f libfilecmp.so.0.0
+	rm -f $(SONAME)
