@@ -607,7 +607,7 @@ proc makewins {} {
 
     # Native-style menubar
     menu .bar
-    .bar add cascade -label "File" -menu .bar.file
+    .bar add cascade -label "File" -menu .bar.file -accelerator "Alt-F" -underline 0
 
     # File menu
     menu .bar.file
@@ -632,17 +632,17 @@ proc makewins {} {
     # Diff menu
     set diffbut .bar.diff
     menu $diffbut
-    .bar add cascade -label "Diff" -menu $diffbut
+    .bar add cascade -label "Diff" -menu $diffbut -accelerator "Alt-D" -underline 0
     $diffbut add command -label "All" -command difffiles
 
     # Copy menu
     set copybut .bar.copy
     menu $copybut
-    .bar add cascade -label "Copy/Del" -menu $copybut
+    .bar add cascade -label "Copy/Del" -menu $copybut -accelerator "Alt-C" -underline 0
 
     # Options menu
     menu .bar.options
-    .bar add cascade -label "Options" -menu .bar.options
+    .bar add cascade -label "Options" -menu .bar.options -accelerator "Alt-O" -underline 0
 
     .bar.options add radiobutton -label "Literal comparison" \
 	    -variable rcsflag -value " " \
@@ -683,7 +683,7 @@ proc makewins {} {
 
     # Help menu
     menu .bar.help
-    .bar add cascade -label "Help" -menu .bar.help
+    .bar add cascade -label "Help" -menu .bar.help -accelerator "Alt-H" -underline 0
     .bar.help add command -label "About dirdiff" -command about
     .bar.help add command -label "About diff" -command about_diff
     .bar.help add command -label "Show help text" -command helptext
