@@ -20,7 +20,7 @@
 #define memmove(t, f, n)	bcopy(f, t, n)
 #endif
 
-char *rcs_ignores[] = {
+static char *rcs_ignores[] = {
     "Log",			/* must be at index 0! */
     "Id",
     "Revision",
@@ -32,7 +32,7 @@ char *rcs_ignores[] = {
     NULL
 };
 
-char *comment_leaders[] = {
+static char *comment_leaders[] = {
     " *",
     "#",
     NULL
@@ -44,8 +44,7 @@ char *comment_leaders[] = {
  * Return 0 if it isn't a tag, -1 if it looks like a tag but is incomplete,
  * or the length of the tag.
  */
-int
-tag_length(p, n)
+static int tag_length(p, n)
     char *p;
     int n;
 {
