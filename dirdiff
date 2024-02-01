@@ -22,6 +22,7 @@ set rcsflag {}
 set diffbflag {}
 set diffBflag {}
 set diffiflag {}
+set diffIregex {}
 set diffwflag {}
 set diffdflag {}
 set ctxlines 3
@@ -41,6 +42,7 @@ set defaultcvsignore {
     .make.state .nse_depinfo *~ \#* .\#* ,* _$* *$
     *.old *.bak *.BAK *.orig *.rej .del-* *.a *.olb
     *.o *.obj *.so *.exe *.Z *.elc *.ln core
+    .git/
 }
 
 if {$tcl_platform(platform) == "windows"} {
@@ -94,8 +96,9 @@ Options:
    -r, --rcs		ignore differences in RCS strings
    -c, --context num	set number of lines of context to show
    -b, -w, -B, -i, -d	pass these on to diff(1)
+   -m pattern		pass on to diff(1) as -I (ignore matching lines)
    -S			show files that are the same in the file list
-   -C			Ignore files listed in .cvsignore files
+   -C			Ignore files listed in .cvsignore and .gitignore files
 
 Note: dirdiff needs to be able to load the libfilecmp.so.0.0 shared library
 for the -r or -t flags to work.}
@@ -166,24 +169,28 @@ proc addfiles {sd} {
 	}
     }
     if {$docvsignore} {
-	# read the .cvsignore in each directory
+        # read the .cvsignore and .gitignore in each directory
 	set cvsignores($sd) {}
 	foreach d $dirs {
+	    set ign $defaultcvsignore
 	    catch {
-		set ign $defaultcvsignore
-		set f [open $d/$sd.cvsignore r]
-		while {[gets $f line] >= 0} {
-		    foreach i [split $line] {
-			if {$i == "!"} {
-			    set ign {}
-			} else {
-			    lappend ign $i
+		foreach fn {cvsignore gitignore} {
+		    if { [file readable $d/$sd.$fn] } {
+			set f [open $d/$sd.$fn r]
+			while {[gets $f line] >= 0} {
+			    foreach i [split $line] {
+				if {$i == "!"} {
+				    set ign {}
+				} else {
+				    lappend ign $i
+				}
+			    }
 			}
+			close $f
 		    }
 		}
-		close $f
-		set cvsignores($sd) [concat $cvsignores($sd) $ign]
 	    }
+	    set cvsignores($sd) [concat $cvsignores($sd) $ign]
 	}
 	set cvsignores($sd) [lsort -unique $cvsignores($sd)]
     }
@@ -263,9 +270,12 @@ proc notcvsignored {f} {
 	set sd ""
     }
     set ft [file tail $f]
+    set lfs [file split $f]
     if {$docvsignore && [info exists cvsignores($sd)]} {
 	foreach n $cvsignores($sd) {
-	    if {[string match $n $ft]} {
+	    if {[string match $n $ft] ||
+	       ([string first "/" $n] == 0 && [string match [string range $n 1 end] $ft]) ||
+	       ([string last "/" $n] >= 0 && [lsearch $lfs [string range $n 0 end-1]] >= 0 )} {
 		return 0
 	    }
 	}
@@ -597,6 +607,7 @@ proc makewins {} {
     global canvw numlines linespc arroww diffbut copybut filelabel nofilecmp
     global filemode dirs dirinterest filelistfont dirreadonly
     global rcsflag diffiflag diffwflag diffbflag diffBflag diffdflag
+    global diffIregex
     global bgcolors
 
     set i 0
@@ -657,7 +668,7 @@ proc makewins {} {
 	    -variable redisp_immed
     .bar.options add checkbutton -label "Show files that aren't in some dirs" \
 	    -variable nxdirmode
-    .bar.options add checkbutton -label "Ignore files in .cvsignore" \
+    .bar.options add checkbutton -label "Ignore files in .cvsignore and .gitignore" \
 	    -variable docvsignore
     .bar.options add command -label "Excluded files..." -command exclfilelist
     .bar.options add command -label "Diff options..." -command diffoptions
@@ -1534,6 +1545,7 @@ proc diff2 {d1 d2 f {orig 1}} {
 
     global textw groups dirs numgroups bgcolors selfile texttop
     global difff lno diffdirs diffiflag diffwflag diffbflag diffBflag diffdflag
+    global diffIregex
     global ctxlines difffile charwidth mergebut diffcolors
     global diffing filemode rediffed diffnewfirst underlinetabs
     global nextlix diffndirs allf origdiffdirs difftabs
@@ -1566,7 +1578,10 @@ proc diff2 {d1 d2 f {orig 1}} {
     }
     set path1 [joinname $d1 $f]
     set path2 [joinname $d2 $f]
-    set diffopts "-U $ctxlines $diffiflag $diffwflag $diffbflag $diffBflag $diffdflag"
+    set diffopts [string trim "-U $ctxlines $diffiflag $diffwflag $diffbflag $diffBflag $diffdflag"]
+    if { [string length [string trim $diffIregex]] > 0 } {
+      append diffopts " -I \"${diffIregex}\""
+    }
 
     if { [llength $diffprogram] > 0} {
        exec $diffprogram $path1 $path2 &
@@ -1665,6 +1680,7 @@ proc readdiff {f} {
     global incline linelist
     global file1lnum file2lnum diffing textfont
     global fcontents allf
+    global diffIregex
     if {$f != $difff} {
 	catch {close $f}
 	return
@@ -1680,6 +1696,8 @@ proc readdiff {f} {
 	    if {$t != ""} {
 		$textw tag add $t "end - 1l" end
 	    }
+        } else {
+            $textw insert end "(Empty diff - possibly due to -m option regex: '$diffIregex')\n"
 	}
 	$textw conf -state disabled
 	if {$lno > 3} {
@@ -2521,6 +2539,7 @@ proc diffn {dirlist f {orig 1}} {
     global difflnos diffndirs diffstate difflnum nextdiffhdr diffhdr
     global diffiflag diffwflag diffbflag diffdflag incline
     global diffblocked fcontents ldisp havediffs nextlix origdiffdirs
+    global diffIregex
 
     if {$orig} {
 	set origdiffdirs $dirlist
@@ -2546,7 +2565,10 @@ proc diffn {dirlist f {orig 1}} {
     set nextlix 1000
     catch {unset incline}
 
-    set diffopts "-u $diffiflag $diffwflag $diffbflag $diffdflag"
+    set diffopts [string trim "-u $diffiflag $diffwflag $diffbflag $diffdflag"]
+    if { [string length [string trim $diffIregex]] > 0 } {
+      append diffopts " -I \"${diffIregex}\""
+    }
     set d [lindex $dirlist 0]
     set p [joinname $d $f]
     set diffrel(0) 0
@@ -3846,6 +3868,14 @@ proc diffoptions {} {
     pack $optionw.ctx.l -side left
     entry $optionw.ctx.v -width 5 -textvariable ctxlines
     pack $optionw.ctx.v -side left
+
+    frame $optionw.diffIregex
+    pack $optionw.diffIregex -side top
+    label $optionw.diffIregex.l -text "Ignore line (regex): "
+    pack $optionw.diffIregex.l -side left
+          entry $optionw.diffIregex.v -width 10 -textvariable diffIregex
+    pack $optionw.diffIregex.v -side left
+
     button $optionw.save -text "Save options" -command saveoptions
     pack $optionw.save -side top -fill x
     frame $optionw.space -height 6
@@ -3857,6 +3887,7 @@ proc diffoptions {} {
 
 proc saveoptions {} {
     global rcsflag diffiflag diffwflag diffbflag diffBflag diffdflag
+    global diffIregex
     global ctxlines showsame underlinetabs nukefiles redisp_immed
     global diffprogram showprogram
     global diffnewfirst textfont filelistfont nxdirmode
@@ -3866,6 +3897,7 @@ proc saveoptions {} {
     puts $f [list set showprogram $showprogram]
     puts $f [list set rcsflag $rcsflag]
     puts $f [list set diffiflag $diffiflag]
+    puts $f [list set diffIregex $diffIregex]
     puts $f [list set diffwflag $diffwflag]
     puts $f [list set diffbflag $diffbflag]
     puts $f [list set diffBflag $diffBflag]
@@ -4678,6 +4710,15 @@ if {![info exists dirs]} {
 		    incr i
 		    if {$i < $argc} {
 			set maxdepth [lindex $argv $i]
+		    } else {
+			puts stderr "no argument given to $arg option"
+			set ok 0
+		    }
+		}
+		"-m" {
+		    incr i
+		    if {$i < $argc} {
+			set diffIregex [lindex $argv $i]
 		    } else {
 			puts stderr "no argument given to $arg option"
 			set ok 0
